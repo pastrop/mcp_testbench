@@ -1,0 +1,21 @@
+  {
+      "mcpServers": {
+
+          "memory": {
+              "command": "npx",
+              "args": [
+                  "-y",
+                  "@modelcontextprotocol/server-memory"
+              ],
+                "env": {
+                    "MEMORY_FILE_PATH": "memory.json"
+                }
+              
+          },
+
+          "research": {
+              "command": "uv",
+              "args": ["run", "mcp_server.py"]
+          }
+      }
+  }
