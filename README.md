@@ -1,0 +1,1 @@
+A test implemntation of the multi-tool tool agent using MCP Architecture. To run locally, clone the repo and use pyproject.toml to install dependency (assuming uv project manager).  Don't forgert to setup your model key as an CLAUDE_KEY env. variable. CLAUDE_KEY is a default Change it in chat_mcp_client_multiserver.py as needed.
