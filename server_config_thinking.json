@@ -1,0 +1,17 @@
+  {
+      "mcpServers": {
+
+          "memory": {
+              "command": "npx",
+              "args": [
+                  "-y",
+                  "@modelcontextprotocol/server-sequential-thinking"
+              ]              
+          },
+
+          "research": {
+              "command": "uv",
+              "args": ["run", "mcp_server.py"]
+          }
+      }
+  }

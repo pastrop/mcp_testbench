@@ -1,6 +1,6 @@
 #from dotenv import load_dotenv
 from anthropic import Anthropic
-from mcp import ClientSession, StdioServerParameters, types
+from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from typing import List, Dict
 import asyncio
@@ -127,7 +127,7 @@ class MCP_ChatBot:
                         'content': [{'type': 'text', 'text': memory_context}]
                     }
                     self.conversation_history.append(context_message)
-                    print(f"Loaded previous memories: {memory_result.content}")
+                    #print(f"Loaded previous memories: {memory_result.content}")
             except:
                 pass  # No existing memories or memory server not available
             
