@@ -36,7 +36,24 @@ class SequentialThinkingMCPClient:
         """Async context manager exit"""
         await self.disconnect()
         await self.exit_stack.aclose()
-            
+
+    '''
+    #Template code for loading configs for MCP servers
+    def load_server_config(self):
+        """Load server configuration from JSON file"""
+        try:
+            with open('server_config_.json', 'r') as f:
+                config = json.load(f)
+                print("Loaded server configuration:", config)
+                return config.get('mcpServers', {})
+        except FileNotFoundError:
+            print("server_config_memory.json not found")
+            return {}
+        except json.JSONDecodeError:
+            print("Error parsing server_config_memory.json")
+            return {}    
+    '''
+
     async def connect(self):
         """Connect to both MCP servers"""
         print('CONNECTING TO THE SERVERS')
@@ -50,11 +67,6 @@ class SequentialThinkingMCPClient:
         self.thinking_client = await self.exit_stack.enter_async_context(
             stdio_client(thinking_server_params)
         )
-
-        '''
-        async with stdio_client(thinking_server_params) as thinking_client:
-            self.thinking_client = thinking_client
-        '''
 
         # Connect to local tools server
         local_server_params = StdioServerParameters(
@@ -74,14 +86,6 @@ class SequentialThinkingMCPClient:
         await self.local_tools_session.initialize()
 
 
-        '''
-        async with stdio_client(local_server_params) as stdio_transport:
-            read, write = stdio_transport
-            async with ClientSession(read, write) as session:
-                self.local_tools_session = session
-                await self.local_tools_session.initialize()        
-
-        '''
         local_response = await self.local_tools_session.list_tools()
         #local_tools=[]
         for tool in local_response.tools:
@@ -91,7 +95,7 @@ class SequentialThinkingMCPClient:
                         "input_schema": tool.inputSchema
                     })
 
-        print(f'line 79: Available Local Tools: {self.local_tools}')
+        #print(f'line 94: Available Local Tools: {self.local_tools}')
 
         
         print("Connected to Sequential Thinking MCP server and local tools server")
@@ -178,26 +182,43 @@ class SequentialThinkingMCPClient:
     
     async def select_tools_and_answer(self, query: str, analysis: Dict[str, Any],tools) -> str:
         """Step 3: Select appropriate tools and produce final answer"""
-        print('LINE 164 - SELECT TOOLS AND ANSWER')
+        print('LINE 181 - SELECT TOOLS AND ANSWER')
         # Get available tools from local MCP server
 
-        print(f"\n**** Line 167 Tools available: {self.local_tools}")
+        #print(f"\n**** Line 184 Tools available: {self.local_tools}")
 
         # Convert MCP Tool objects to Anthropic API format
         anthropic_tools = []
         for tool in tools:  
             anthropic_tool = {
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.inputSchema  # This is already a dict/JSON Schema
+                "name": tool["name"],
+                "description": tool["description"],
+                "input_schema": tool["input_schema"]  # This is already a dict/JSON Schema
             }
             anthropic_tools.append(anthropic_tool)
 
+        print(f"\n**** Line 196 Anthropic Tools available: {anthropic_tools}")
+
+        #Analysis: {json.dumps(analysis)}
+
+
+        analysis_prompt = f"""
+        Analyze this query and break it down:
+        Query: {query}
+        
+        Please provide:
+        1. Intent (what the user wants to accomplish)
+        2. Key concepts or topics involved
+        3. Information needs (what data/context would be helpful)
+        4. Tool needs (what tools would be useful to have access to)
+        
+        Return as JSON with keys: intent, concepts, information_needs, tools
+        """
 
         final_prompt = f"""
         Original query: {query}
         
-        Analysis: {json.dumps(analysis)}
+
         
         Provide a comprehensive answer to the query using the context and tools available.
         """
@@ -206,12 +227,15 @@ class SequentialThinkingMCPClient:
         print(f'LINE 198 final_prompt:{final_prompt}')
         print("="*50)
 
-        # Fallback to Claude
         claude_response = self.claude_client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=2000,
-            messages=[{"role": "user", "content": final_prompt}]
+            messages=[{"role": "user", "content": analysis_prompt}]
         )
+        print("\n" + "="*50)
+        print(f'LINE 218 claude call response-analysis prompt:{claude_response.content[0].text}')
+        print("="*50)
+
         return claude_response.content[0].text
     
     async def process_query(self, query: str, text_corpus: List[str] = None) -> Dict[str, Any]:
@@ -219,7 +243,7 @@ class SequentialThinkingMCPClient:
         if text_corpus:
             self.text_corpus = text_corpus
             
-        # Step 1: Analyze query
+        # Step 1: Analyze query (Line 103)
         print("Step 1: Analyzing query...")
         analysis = await self.analyze_query(query)
         
@@ -227,15 +251,15 @@ class SequentialThinkingMCPClient:
         #print("Step 2: Selecting relevant context...")
         #selected_context = await self.select_context(analysis, self.text_corpus)
         
-        # Step 3: Generate final answer
-        #print("Step 3: Generating final answer...")
-        #final_answer = await self.select_tools_and_answer(query, analysis, self.local_tools)
+        # Step 3: Generate final answer (Line 179)
+        print("Step 3: Generating final answer...")
+        final_answer = await self.select_tools_and_answer(query, analysis, self.local_tools)
         
         return {
             "query": query,
             "analysis": analysis,
             #"selected_context": selected_context,
-            #"final_answer": final_answer
+            "final_answer": final_answer
         }
 
 
@@ -257,7 +281,7 @@ async def main():
         try:
             # Get and display available tools from local server
             tools = client.local_tools
-            print(f"print in line 288 - Available local tools: {tools}")
+            #print(f"print in line 266 - Available local tools: {tools}")
 
             # Process a sample query
             query = "What is the relationship between machine learning and neural networks?"

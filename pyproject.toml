@@ -9,5 +9,8 @@ dependencies = [
     "arxiv>=2.2.0",
     "fastmcp>=2.5.2",
     "nest-asyncio>=1.6.0",
+    "pandas>=2.2.0",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.0.0",
     "zev>=0.8.1",
 ]
