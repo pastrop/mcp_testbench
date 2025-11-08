@@ -24,8 +24,8 @@ class PandasQueryAgent:
 
     # Model configurations
     MODELS = {
-        "sonnet": "claude-sonnet-4-20250514",  # Claude Sonnet 4.5
-        "haiku": "claude-haiku-4-20250520",    # Claude Haiku 4.5
+        "sonnet": "claude-sonnet-4-20250514",      # Claude Sonnet 4 (latest)
+        "haiku": "claude-haiku-4-5-20251001",      # Claude Haiku 4.5 (latest)
     }
 
     def __init__(
@@ -55,6 +55,7 @@ class PandasQueryAgent:
         # MCP session (initialized when connecting)
         self.session: Optional[ClientSession] = None
         self.available_tools: List[Dict[str, Any]] = []
+        self.dataset_info: Optional[Dict[str, Any]] = None  # Cached schema info
 
     @asynccontextmanager
     async def connect_to_server(self, server_script: str, data_file: str):
@@ -95,22 +96,48 @@ class PandasQueryAgent:
 
                 print(f"Connected to MCP server. Available tools: {len(self.available_tools)}")
 
+                # Load dataset schema immediately after connection
+                try:
+                    print("Loading dataset schema...")
+                    schema_result = await session.call_tool("get_schema", {})
+                    schema_json = "".join(
+                        item.text if hasattr(item, "text") else str(item)
+                        for item in schema_result.content
+                    )
+                    self.dataset_info = json.loads(schema_json)
+
+                    columns = [col["name"] for col in self.dataset_info["columns"]]
+                    print(f"Dataset loaded: {self.dataset_info['total_rows']} rows, {len(columns)} columns")
+                except Exception as e:
+                    print(f"Warning: Could not load schema: {e}")
+                    self.dataset_info = None
+
                 try:
                     yield self
                 finally:
                     self.session = None
                     self.available_tools = []
+                    self.dataset_info = None
 
     def _create_system_prompt(self) -> str:
         """Create system prompt with tool descriptions and reasoning instructions."""
-        return """You are an expert data analyst assistant that helps users query and analyze transaction data stored in a Pandas DataFrame.
+
+        # Build dataset information dynamically
+        if self.dataset_info:
+            columns = [col["name"] for col in self.dataset_info["columns"]]
+            total_rows = self.dataset_info["total_rows"]
+
+            dataset_description = f"""- You have access to MCP tools that can query a dataset with {total_rows:,} rows and the following columns:
+  {", ".join(columns)}"""
+        else:
+            # Fallback if schema wasn't loaded
+            dataset_description = """- You have access to MCP tools that can query a dataset.
+- Use the get_schema tool first to understand the available columns and data structure."""
+
+        return f"""You are an expert data analyst assistant that helps users query and analyze data stored in a Pandas DataFrame.
 
 Your capabilities:
-- You have access to MCP tools that can query a transaction dataset with the following columns:
-  comission_eur, amount_eur, card_brand_group, traffic_type_group, transaction_comission,
-  country, order_id, created_date, manager_id, merchant_name, gate_id, merchant_id,
-  company_id, company_name, white_label_id, processor_name, processor_id, transaction_type,
-  transaction_status, agent_fee, card_type, tax_reserve_cost, monthly_fee, item_id, records
+{dataset_description}
 
 - You can perform SQL-like operations: filtering, aggregation, grouping, sorting, searching, etc.
 
@@ -126,7 +153,7 @@ Your reasoning process:
 
 Important guidelines:
 - Use extended thinking to reason through complex queries
-- Always start with get_schema if you need to understand the data structure
+- The column information is provided above - you don't need to call get_schema unless you need detailed column statistics
 - For complex queries, you may need multiple tool calls
 - Present results clearly with relevant context
 - If results are truncated, mention this to the user

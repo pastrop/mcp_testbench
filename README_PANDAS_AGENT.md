@@ -21,7 +21,7 @@ Provides 10 specialized tools for querying transaction data:
 
 ### 2. MCP Client (`mcp_client_agent.py`)
 Intelligent agent that:
-- Uses Claude Sonnet 4.5 (with extended thinking) or Haiku 4.5
+- Uses Claude Sonnet 4 (with extended thinking) or Claude Haiku 4.5
 - Reasons about user queries to select appropriate tools
 - Chains multiple tool calls for complex queries
 - Validates if queries can be answered with available data
@@ -66,7 +66,7 @@ Start the agent in interactive mode:
 # Using Sonnet 4.5 (default - best for complex queries)
 python mcp_client_agent.py mcp_server_pandas.py sample_transactions.csv sonnet
 
-# Using Haiku 4.5 (faster for simple queries)
+# Using Claude Haiku 4.5 (faster for simple queries)
 python mcp_client_agent.py mcp_server_pandas.py sample_transactions.csv haiku
 ```
 
@@ -122,7 +122,7 @@ Write me a Python function
 
 ## Model Selection
 
-### Claude Sonnet 4.5 (Recommended)
+### Claude Sonnet 4 (Recommended)
 - **Use for:** Complex queries, multi-step reasoning, ambiguous requests
 - **Features:** Extended thinking, better reasoning, more accurate
 - **Performance:** ~5-15 seconds per query
@@ -132,7 +132,7 @@ Write me a Python function
 - **Use for:** Simple queries, single operations, quick answers
 - **Features:** Fast responses, efficient
 - **Performance:** ~2-5 seconds per query
-- **Model ID:** `claude-haiku-4-20250520`
+- **Model ID:** `claude-haiku-4-5-20251001`
 
 ## Query Processing Flow
 

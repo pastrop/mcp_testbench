@@ -16,14 +16,14 @@ SERVER_SCRIPT = PROJECT_ROOT / "mcp_server_pandas.py"
 MODELS = {
     "sonnet": {
         "id": "claude-sonnet-4-20250514",
-        "name": "Claude Sonnet 4.5",
+        "name": "Claude Sonnet 4",
         "max_tokens": 4096,
         "thinking_enabled": True,
         "thinking_budget": 2000,
         "description": "Most capable model with extended thinking for complex queries"
     },
     "haiku": {
-        "id": "claude-haiku-4-20250520",
+        "id": "claude-haiku-4-5-20251001",
         "name": "Claude Haiku 4.5",
         "max_tokens": 4096,
         "thinking_enabled": False,

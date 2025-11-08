@@ -2,7 +2,7 @@
 
 ## What You've Got
 
-A complete MCP-based agent system for querying Pandas DataFrames using natural language with Claude Sonnet 4.5 and Haiku 4.5.
+A complete MCP-based agent system for querying Pandas DataFrames using natural language with Claude Sonnet 4 and Claude Haiku 4.5.
 
 ## Files Created
 
@@ -57,10 +57,10 @@ Which card brand has the highest total amount?
 ## Model Switching
 
 ```bash
-# Use Sonnet 4.5 (best reasoning, slower)
+# Use Sonnet 4 (best reasoning, slower)
 ./run_agent.sh sonnet
 
-# Use Haiku 4.5 (fast, good for simple queries)
+# Use Claude Haiku 4.5 (fast, good for simple queries)
 ./run_agent.sh haiku
 ```
 
@@ -104,7 +104,7 @@ User Query → Claude (Reasoning) → MCP Tools → Pandas Operations → Result
 ┌─────────────────────────────────────────────────────────────┐
 │                    MCP Client (Agent)                        │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │  Claude Sonnet 4.5 / Haiku 4.5 (Configurable)        │  │
+│  │  Claude Sonnet 4 / Claude Haiku 4.5 (Configurable)   │  │
 │  │  • Extended Thinking enabled                          │  │
 │  │  • Tool selection & reasoning                         │  │
 │  │  • Multi-step query decomposition                     │  │
@@ -176,7 +176,7 @@ User Query → Claude (Reasoning) → MCP Tools → Pandas Operations → Result
 5. **Return to User**
 
 **Key Features:**
-- Extended thinking for complex queries (Sonnet 4.5)
+- Extended thinking for complex queries (Sonnet 4)
 - 10 specialized Pandas query tools
 - Natural language Q&A
 - Validates query scope
@@ -214,7 +214,7 @@ uv sync
 
 ## Model Comparison
 
-| Feature | Sonnet 4.5 | Haiku 4.5 |
+| Feature | Sonnet 4 | Haiku 4.5 |
 |---------|-----------|----------|
 | Speed | ~5-15s | ~2-5s |
 | Reasoning | Excellent | Good |

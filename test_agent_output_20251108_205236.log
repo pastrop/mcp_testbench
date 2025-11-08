@@ -1,0 +1,111 @@
+============================================================
+Pandas Query Agent - Test Mode
+Test started: 2025-11-08 20:52:36
+Logging to: test_agent_output_20251108_205236.log
+============================================================
+Connected to MCP server. Available tools: 10
+Loading dataset schema...
+Dataset loaded: 500 rows, 25 columns
+
+Running 3 test queries...
+
+
+============================================================
+TEST 1: Schema query - tests get_schema tool
+============================================================
+Query: What is the schema of the dataset?
+
+Processing...
+[Tool Call] get_schema with input: {}
+[Tool Result] Success: 7817 characters
+
+Response:
+Here's the schema of your dataset:
+
+**Dataset Overview:**
+- **Total Rows:** 500
+- **Total Columns:** 25
+
+**Column Details:**
+
+**Numeric Columns:**
+1. **comission_eur** (float64) - Commission in EUR, Range: 0.8-235.23, Mean: 78.86, No nulls
+2. **amount_eur** (float64) - Transaction amount in EUR, Range: 27.97-4987.16, Mean: 2613.59, No nulls
+3. **transaction_comission** (float64) - Transaction commission, Range: 0.1-1.99, Mean: 1.03, No nulls
+4. **agent_fee** (float64) - Agent fee, Range: 0.21-49.58, Mean: 23.94, No nulls
+5. **tax_reserve_cost** (float64) - Tax reserve cost, Range: 0.22-708.98, Mean: 196.32, No nulls
+6. **monthly_fee** (float64) - Monthly fee, Range: 0.0-99.77, Mean: 13.75, No nulls
+7. **records** (int64) - Number of records, Range: 1-10, Mean: 5.46, No nulls
+
+**Categorical Columns:**
+1. **card_brand_group** - 5 unique values (Visa, Discover, etc.)
+2. **traffic_type_group** - 5 unique values (Online, ATM, Mobile, etc.)
+3. **country** - 10 unique values (FR, UK, BE, DE, etc.)
+4. **card_type** - 4 unique values (virtual, credit, debit)
+5. **transaction_type** - 5 unique values (refund, capture, authorization)
+6. **transaction_status** - 5 unique values (processing, completed, cancelled)
+7. **processor_name** - 5 unique values (Stripe, PayPal, Adyen, etc.)
+
+**ID/Reference Columns:**
+- **order_id** - 500 unique values (ORD-XXXXXX format)
+- **manager_id** - 20 unique values (MGR-XXX format)
+- **merchant_id** - 50 unique values (MERCH-XXX format)
+- **merchant_name** - 50 unique values (Merchant_X format)
+- **company_id** - 10 unique values (COMP-XX format)
+- **company_name** - 10 unique values (Company_X format)
+- **gate_id** - 10 unique values (GATE-XX format)
+- **processor_id** - 5 unique values (PROC-XX format)
+- **white_label_id** - 5 unique values (WL-XX format)
+- **item_id** - 100 unique values (ITEM-XXXX format)
+
+**Date Column:**
+- **created_date** - Timestamp format (2024 dates with various times), 500 unique values
+
+**Data Quality:** All columns have 0 null values, indicating complete data coverage across all 500 records.
+
+✓ Test 1 passed
+
+============================================================
+TEST 2: Count query - tests get_row_count tool
+============================================================
+Query: How many total transactions are in the dataset?
+
+Processing...
+[Tool Call] get_row_count with input: {}
+[Tool Result] Success: 39 characters
+
+Response:
+There are **500 total transactions** in the dataset.
+
+✓ Test 2 passed
+
+============================================================
+TEST 3: Aggregation query - tests group_by_aggregate and get_top_n
+============================================================
+Query: What are the top 5 merchants by total transaction amount?
+
+Processing...
+[Tool Call] group_by_aggregate with input: {
+  "group_columns": "merchant_name",
+  "agg_column": "amount_eur",
+  "agg_function": "sum"
+}
+[Tool Result] Success: 4337 characters
+
+Response:
+Based on the analysis, here are the **top 5 merchants by total transaction amount**:
+
+1. **Merchant_26** - €52,491.92
+2. **Merchant_29** - €43,478.10
+3. **Merchant_21** - €40,864.63
+4. **Merchant_42** - €40,353.73
+5. **Merchant_6** - €39,684.15
+
+Merchant_26 leads significantly with over €52,000 in total transaction volume, followed by Merchant_29 with €43,478. The top 5 merchants combined account for €216,872.53 in total transaction amounts.
+
+✓ Test 3 passed
+
+============================================================
+All tests completed!
+============================================================
+
