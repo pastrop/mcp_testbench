@@ -63,7 +63,7 @@ python create_sample_data.py 1000 sample_transactions.csv
 Start the agent in interactive mode:
 
 ```bash
-# Using Sonnet 4.5 (default - best for complex queries)
+# Using Sonnet 4 or 4.5 (default - best for complex queries, trying different versions)
 python mcp_client_agent.py mcp_server_pandas.py sample_transactions.csv sonnet
 
 # Using Claude Haiku 4.5 (faster for simple queries)
