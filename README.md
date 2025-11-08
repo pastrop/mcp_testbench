@@ -29,7 +29,7 @@ Intelligent agent that:
 
 ## Data Schema
 
-The system expects transaction data with these columns:
+The data schema as defined at when the dataset is ingested. Below is a schema example:
 ```
 comission_eur, amount_eur, card_brand_group, traffic_type_group,
 transaction_comission, country, order_id, created_date, manager_id,
