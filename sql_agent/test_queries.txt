@@ -1,0 +1,14 @@
+What is the total transaction amount in EUR for all approved transactions in the last month?
+Which merchants have the highest total commission fees across all their transactions?
+What is the average MDR percentage applied to Visa transactions compared to Mastercard transactions?
+How many transactions were declined by each processor, and what are the most common error codes?
+What is the distribution of transaction types (payment, payout, refund) by merchant group?
+Which countries generate the most transaction volume, and what is their approval rate?
+What is the total FX reserve fee collected across all transactions involving currency conversion?
+How do commission structures differ between EU and non-EU transactions?
+What percentage of total revenue comes from agent commissions versus direct merchant fees?
+Which traffic type groups (card, apple_pay, google_pay, etc.) have the highest average transaction amounts?
+What is the monthly trend of transaction volumes by processor over the past year?
+How many transactions hit the minimum commission threshold versus the MDR-based calculation?
+What is the total VAT collected per merchant, grouped by VAT type?
+

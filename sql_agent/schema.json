@@ -1,0 +1,530 @@
+[
+    {
+        "name": "fx_eur",
+        "type": "FLOAT",
+        "short_description": "FX (rate reserve fee)_EUR",
+        "detailed_description": "the amount (in euros) reserved as a fee related to currency exchange rate differences during transaction processing"
+    },
+    {
+        "name": "comission_eur",
+        "type": "FLOAT",
+        "short_description": "Total commission_EUR",
+        "detailed_description": "the total commission amount (in euros) applied to the transaction, including all relevant components such as MDR, fixed fees, FX adjustments, and agent or platform commissions"
+    },
+    {
+        "name": "min_eur",
+        "type": "FLOAT",
+        "short_description": "Minimal commission_EUR",
+        "detailed_description": "the minimum commission amount (in euros) charged or applicable per transaction or settlement, as defined in the acquirer's financial terms"
+    },
+    {
+        "name": "mdr_eur",
+        "type": "FLOAT",
+        "short_description": "MDR, % (merchant discount rate)_EUR",
+        "detailed_description": "the percentage fee (converted to euro equivalent) charged by the acquirer on the total transaction amount, representing the cost of processing card payments for the merchant"
+    },
+    {
+        "name": "base_eur",
+        "type": "FLOAT",
+        "short_description": "Base_EUR (MDR or min/max, depending on the rule outcome)",
+        "detailed_description": "the final commission amount in euros determined according to the applicable rule: either calculated as the MDR fee or adjusted to the predefined minimum or maximum commission threshold"
+    },
+    {
+        "name": "agent_eur",
+        "type": "FLOAT",
+        "short_description": "Agent's commission_EUR",
+        "detailed_description": "the commission amount (in euros) allocated to an agent or intermediary involved in the transaction or merchant/acquirer acquisition, based on the agreed revenue-sharing or partnership terms"
+    },
+    {
+        "name": "settle_eur",
+        "type": "FLOAT",
+        "short_description": "Settlement Fee_EUR",
+        "detailed_description": "the fee amount (in euros) charged by the acquirer or payment provider for executing the settlement of funds"
+    },
+    {
+        "name": "tax_reserved_eur",
+        "type": "FLOAT",
+        "short_description": "Tax reserved fee_EUR",
+        "detailed_description": "the amount (in euros) withheld or reserved to cover potential tax obligations related to the transaction, such as withholding tax or other jurisdiction-specific charges"
+    },
+    {
+        "name": "other_eur",
+        "type": "FLOAT",
+        "short_description": "Add. Fee_EUR",
+        "detailed_description": "an additional fee amount (in euros) applied to the transaction based on specific conditions or service types"
+    },
+    {
+        "name": "mer_agent_eur",
+        "type": "FLOAT",
+        "short_description": "Merchant Agent Fee_EUR",
+        "detailed_description": "the fee amount (in euros) payable to a merchant's appointed agent or intermediary for services such as onboarding, account management, or transaction facilitation, as defined in the partnership agreement"
+    },
+    {
+        "name": "fshop_eur",
+        "type": "FLOAT",
+        "short_description": "Frontshop Fee_EUR",
+        "detailed_description": "the fee amount charged to the merchant or partner in EUR, representing the front-end (merchant-facing) commission"
+    },
+    {
+        "name": "fixed_eur",
+        "type": "FLOAT",
+        "short_description": "Fixed fee per transaction_EUR",
+        "detailed_description": "a predefined flat fee (in euros) charged for each processed transaction, regardless of its amount or type, as specified in the applicable tariff or acquirer agreement"
+    },
+    {
+        "name": "icc_eur",
+        "type": "FLOAT",
+        "short_description": "ICC commission_EUR",
+        "detailed_description": "the commission amount (in euros) applied to transactions processed under intercharge or international card schemes (ICC), typically covering cross-border or interregional processing costs defined by the card network"
+    },
+    {
+        "name": "amount_eur",
+        "type": "FLOAT",
+        "short_description": "Transaction amount_EUR",
+        "detailed_description": "The total monetary value of a payment request initiated by a customer. It represents the sum to be authorized, captured, or settled by the payment gateway, including product cost, taxes, fees, and discounts, depending on business rules."
+    },
+    {
+        "name": "card_brand_group",
+        "type": "STRING",
+        "short_description": "Payment System of the Card (Visa, MasterCard, Any)",
+        "detailed_description": "In payment processing, the card brand group refers to the classification of payment cards under major networks like Visa, Mastercard, American Express etc"
+    },
+    {
+        "name": "traffic_type_group",
+        "type": "STRING",
+        "short_description": "The group to which the traffic belongs (FTD-mbway, FTD-multibanco, apple_pay, blik, card, eps, ftd_openbanking, gigadat, giropay, google_pay, mbway, multibanco, oct, openbanking, payid, przelewy, sepa, sofort, wl)",
+        "detailed_description": "The traffic type group categorizes transactions based on their origin, channel or payment type. This grouping helps the gateway apply appropriate processing rules, risk checks, routing logic, and compliance requirements for each transaction type"
+    },
+    {
+        "name": "transaction_comission",
+        "type": "FLOAT",
+        "short_description": "Total commission",
+        "detailed_description": "the total commission amount (in orig. curr.) applied to the transaction, including all relevant components such as MDR, fixed fees, FX adjustments, and agent or platform commissions"
+    },
+    {
+        "name": "country",
+        "type": "STRING",
+        "short_description": "Short BIN_country notation",
+        "detailed_description": "Identifies the country associated with a payment card's Bank Identification Number (BIN). It helps the gateway determine the card's issuing country, enabling fraud checks, compliance enforcement, currency handling, and routing decisions based on regional or cross-border transaction rules"
+    },
+    {
+        "name": "transaction_id",
+        "type": "STRING",
+        "short_description": "Unique Transaction_UUID",
+        "detailed_description": "a system-generated universal unique identifier (UUID) assigned to each transaction"
+    },
+    {
+        "name": "order_id",
+        "type": "STRING",
+        "short_description": "Unique Order_ID",
+        "detailed_description": "a unique identifier assigned to each order within the platform system, used to group related transactions"
+    },
+    {
+        "name": "created_date",
+        "type": "TIMESTAMP",
+        "short_description": "Transaction creation date",
+        "detailed_description": "Timestamp when a payment request is initiated in the gateway"
+    },
+    {
+        "name": "manager_id",
+        "type": "STRING",
+        "short_description": "Manager ID *not being used*",
+        "detailed_description": "-"
+    },
+    {
+        "name": "merchant_name",
+        "type": "STRING",
+        "short_description": "Merchant name in DWH",
+        "detailed_description": "merchant name"
+    },
+    {
+        "name": "gate_id",
+        "type": "STRING",
+        "short_description": "Gate ID in DWH",
+        "detailed_description": "a unique identifier of the processing gateway through which the transaction was routed"
+    },
+    {
+        "name": "merchant_id",
+        "type": "STRING",
+        "short_description": "Merchant ID in DWH",
+        "detailed_description": "a unique identifier assigned to the merchant"
+    },
+    {
+        "name": "company_id",
+        "type": "INTEGER",
+        "short_description": "Merchant's Company_ID in DWH",
+        "detailed_description": "a unique identifier assigned to the merchant's legal entity within the system, used to link transactions, reports, and financial conditions to the specific company record"
+    },
+    {
+        "name": "company_name",
+        "type": "STRING",
+        "short_description": "Merchant's Company_name in DWH",
+        "detailed_description": "merchant's legal entity's name within the system, used to link transactions, reports, and financial conditions to the specific company record"
+    },
+    {
+        "name": "white_label_id",
+        "type": "INTEGER",
+        "short_description": "WhiteLabel_ID in DWH",
+        "detailed_description": "a unique identifier of the white-label partner under which the transaction or merchant operates"
+    },
+    {
+        "name": "processor_name",
+        "type": "STRING",
+        "short_description": "Acquirer name  in DWH",
+        "detailed_description": "the name of the acquiring financial institution or payment provider processing transactions for the merchant"
+    },
+    {
+        "name": "processor_id",
+        "type": "STRING",
+        "short_description": "Acquirer ID  in DWH",
+        "detailed_description": "a unique identifier assigned to the acquiring financial institution or payment provider processing transactions for the merchant"
+    },
+    {
+        "name": "status",
+        "type": "STRING",
+        "short_description": "Transaction status",
+        "detailed_description": "The current state of a payment, such as authorized, captured, declined, or refunded. It helps the gateway, merchants, and banks track progress, enforce business rules, and manage settlements or exceptions."
+    },
+    {
+        "name": "card_brand",
+        "type": "STRING",
+        "short_description": "Card brand name",
+        "detailed_description": "In payment processing, the card brand group refers to the classification of payment cards under major networks like Visa, Mastercard, American Express etc"
+    },
+    {
+        "name": "currency",
+        "type": "STRING",
+        "short_description": "Currency short notation",
+        "detailed_description": "Currency used to initiate the transaction"
+    },
+    {
+        "name": "gate_name",
+        "type": "STRING",
+        "short_description": "The type of funds this gate processes (Debet and Credit Cards, apple_pay, blik, card, eps, gigadat, giropay, google_pay, mbway, multibanco, openbanking, payid, przelewy, sepa, sofort)",
+        "detailed_description": "defines the category of payment instruments or channels processed through this gate (e.g., debit and credit cards, Apple Pay, Google Pay, BLIK, SEPA, Sofort, Giropay, Open Banking, etc.), indicating the specific funding source or payment flow type supported by the gateway"
+    },
+    {
+        "name": "gate_descriptor",
+        "type": "STRING",
+        "short_description": "Gate_MID name in DWH",
+        "detailed_description": "the identifier or descriptive name of the merchant account (MID) assigned by the acquirer within the processing gateway, used to link acquirer-side transaction data with internal gateway records for reconciliation and reporting"
+    },
+    {
+        "name": "source",
+        "type": "STRING",
+        "short_description": "Source (Gate)",
+        "detailed_description": "indicates the originating gateway or processing source from which the transaction data is received"
+    },
+    {
+        "name": "type",
+        "type": "STRING",
+        "short_description": "Type of transaction (payment, payout, refund)",
+        "detailed_description": "Specifies the operation being performed. Payment (customer pays merchant), payout (funds sent to a recipient), or refund (returning a prior payment). It determines processing rules, routing, accounting, and reporting within the gateway."
+    },
+    {
+        "name": "created_date_no_time",
+        "type": "DATE",
+        "short_description": "Transaction creation date without timestamp",
+        "detailed_description": "The day when a payment request is initiated. It is used for tracking, reporting, reconciliation, and applying business rules like settlement cycles, refunds, or transaction validity periods."
+    },
+    {
+        "name": "endpoint_id",
+        "type": "STRING",
+        "short_description": "Endpoint ID",
+        "detailed_description": "A specific channel through which a transaction is initiated or processed. It helps the gateway route transactions, apply relevant business rules, and track performance or issues by source."
+    },
+    {
+        "name": "amount",
+        "type": "FLOAT",
+        "short_description": "Transaction amount in the processing currency",
+        "detailed_description": "The monetary value of a payment being processed"
+    },
+    {
+        "name": "running_sum",
+        "type": "FLOAT",
+        "short_description": "Cumulative sum amount for the calendar month by processor_name in DWH",
+        "detailed_description": "The cumulative total of transaction amounts over a period or batch. It helps track overall financial activity, monitor limits, reconcile accounts, and generate reports for settlements or auditing."
+    },
+    {
+        "name": "card_bank_name",
+        "type": "STRING",
+        "short_description": "Name of the card bank",
+        "detailed_description": "The issuing bank of a payment card."
+    },
+    {
+        "name": "bin",
+        "type": "STRING",
+        "short_description": "User's unique ID",
+        "detailed_description": "BIN (Bank Identification Number) is the initial set of digits on a payment card that identifies its issuing bank and card type. It is used for routing, fraud checks, card validation, and applying network-specific processing rules."
+    },
+    {
+        "name": "error_code",
+        "type": "FLOAT",
+        "short_description": "Transaction error code",
+        "detailed_description": "Describes the code of the reason a transaction failed, used for troubleshooting and reporting."
+    },
+    {
+        "name": "error_message",
+        "type": "STRING",
+        "short_description": "Transaction error message",
+        "detailed_description": "Describes the reason a transaction failed, used for troubleshooting and reporting."
+    },
+    {
+        "name": "external_error_code",
+        "type": "STRING",
+        "short_description": "External error code",
+        "detailed_description": "the numeric or alphanumeric code returned by an external system (such as an acquirer, gateway, or payment provider) that identifies the specific error or decline reason for a transaction"
+    },
+    {
+        "name": "external_error_message",
+        "type": "STRING",
+        "short_description": "External error message",
+        "detailed_description": "the error description or code received from an external system (e.g., acquirer, gateway, or payment provider) explaining the reason for a transaction failure, rejection, or processing issue"
+    },
+    {
+        "name": "main_requisite",
+        "type": "STRING",
+        "short_description": "Payment requisite value",
+        "detailed_description": "Key required information for processing a transaction, such as card number or account details."
+    },
+    {
+        "name": "user_id",
+        "type": "INTEGER",
+        "short_description": "User's unique system ID",
+        "detailed_description": "Unique identifier for the customer or account initiating the transaction."
+    },
+    {
+        "name": "merchant_error_code",
+        "type": "STRING",
+        "short_description": "Merchant error code",
+        "detailed_description": "Specific code returned to indicate why a transaction failed at the merchant's end."
+    },
+    {
+        "name": "merchant_error_message",
+        "type": "STRING",
+        "short_description": "Merchant error message",
+        "detailed_description": "Text description of the merchant's error for logging or customer support."
+    },
+    {
+        "name": "rate_plan_id",
+        "type": "STRING",
+        "short_description": "Tariff rate plan ID",
+        "detailed_description": "a unique identifier of the tariff or fee plan assigned to the merchant, defining the applicable commission rates, fees, and financial conditions"
+    },
+    {
+        "name": "transaction_type",
+        "type": "STRING",
+        "short_description": "Transaction type (payout, reversal, sale) - analytics mapping",
+        "detailed_description": "Specifies the operation being performed. Payment (customer pays merchant), payout (funds sent to a recipient), or refund (returning a prior payment). It determines processing rules, routing, accounting, and reporting within the gateway."
+    },
+    {
+        "name": "transaction_status",
+        "type": "STRING",
+        "short_description": "Transaction status (approved, declined)_analytics mapping",
+        "detailed_description": "Current state of the transaction, e.g., authorized, captured, declined, or refunded."
+    },
+    {
+        "name": "mapping",
+        "type": "STRING",
+        "short_description": "Full country notation",
+        "detailed_description": "Full BIN_country name"
+    },
+    {
+        "name": "european_union",
+        "type": "STRING",
+        "short_description": "Flag whether the country belongs to EU",
+        "detailed_description": "Flag indicating if the transaction involves an EU-based entity for compliance or reporting."
+    },
+    {
+        "name": "eea",
+        "type": "STRING",
+        "short_description": "The European Economic Area flag",
+        "detailed_description": "Flag indicating if the transaction involves an EEA-based entity, impacting regulations and fees."
+    },
+    {
+        "name": "merchant",
+        "type": "STRING",
+        "short_description": "Merchant name_analytics mapping",
+        "detailed_description": "Identifier or name of the business merchant receiving the payment."
+    },
+    {
+        "name": "merchant_group",
+        "type": "STRING",
+        "short_description": "Merchant group_analytics mapping",
+        "detailed_description": "Categorization of merchants for reporting, risk management, or fee structures."
+    },
+    {
+        "name": "kam",
+        "type": "STRING",
+        "short_description": "Responsible Key Account Manager",
+        "detailed_description": "Key Account Manager assigned to the merchant, used for support, escalation, and relationship management."
+    },
+    {
+        "name": "fx_date",
+        "type": "DATE",
+        "short_description": "Date of the Currency Rate",
+        "detailed_description": "the specific date on which the applied exchange rate was valid or recorded, used to convert transaction amounts or fees from the original currency into euros"
+    },
+    {
+        "name": "fx_rate",
+        "type": "FLOAT",
+        "short_description": "Currency Rate Value",
+        "detailed_description": "The conversion rate used to calculate amounts between different currencies."
+    },
+    {
+        "name": "proc_group",
+        "type": "STRING",
+        "short_description": "Acquirer group_analytics mapping",
+        "detailed_description": "the name of the acquiring financial institution or payment provider processing transactions for the merchant (grouped)"
+    },
+    {
+        "name": "descr_group",
+        "type": "STRING",
+        "short_description": "Decriptor group_analytics mapping",
+        "detailed_description": "the identifier or descriptive name of the merchant account (MID) assigned by the acquirer within the processing gateway, used to link acquirer-side transaction data with internal gateway records for reconciliation and reporting"
+    },
+    {
+        "name": "Acquirer",
+        "type": "STRING",
+        "short_description": "Acquier name_analytics mapping",
+        "detailed_description": "the name of the acquiring financial institution or payment provider processing transactions for the merchant"
+    },
+    {
+        "name": "Legal_entity_abb",
+        "type": "STRING",
+        "short_description": "Legal entity_short",
+        "detailed_description": "Short name or code of the legal entity handling the transaction."
+    },
+    {
+        "name": "balance_mapping",
+        "type": "STRING",
+        "short_description": "MID Account in Reconciliation Files",
+        "detailed_description": "Merchant Identification (MID) account used in reconciliation reports for payments received."
+    },
+    {
+        "name": "payout_mapping",
+        "type": "STRING",
+        "short_description": "Payout MID Account in Reconciliation Files",
+        "detailed_description": "MID account used in reconciliation reports for payouts or disbursements."
+    },
+    {
+        "name": "agent_fee",
+        "type": "FLOAT",
+        "short_description": "Agent's commission, orig. currency",
+        "detailed_description": "Commission earned by an agent in the original currency of the transaction."
+    },
+    {
+        "name": "card_type",
+        "type": "STRING",
+        "short_description": "Card type",
+        "detailed_description": "the payment network or scheme under which the transaction was processed (e.g., Visa, Mastercard, or other payment providers such as UnionPay, Amex, or local card schemes)"
+    },
+    {
+        "name": "tax_reserve_cost",
+        "type": "FLOAT",
+        "short_description": "Tax reserved fee, orig. currency",
+        "detailed_description": "the amount (in orig currency) withheld or reserved to cover potential tax obligations related to the transaction, such as withholding tax or other jurisdiction-specific charges"
+    },
+    {
+        "name": "trx",
+        "type": "STRING",
+        "short_description": "Fixed transaction fee_orig. currency",
+        "detailed_description": "a predefined flat fee (in orig. curr.) charged for each processed transaction, regardless of its amount or type, as specified in the applicable tariff or acquirer agreement"
+    },
+    {
+        "name": "minimal",
+        "type": "STRING",
+        "short_description": "Minimal fee_orig. currency",
+        "detailed_description": "the minimum commission amount (in orig. curr.) charged or applicable per transaction or settlement, as defined in the acquirer's financial terms"
+    },
+    {
+        "name": "mdr",
+        "type": "FLOAT",
+        "short_description": "MDR, % (merchant discount rate)_orig.currency",
+        "detailed_description": "the percentage fee (orig. currency) charged by the acquirer on the total transaction amount, representing the cost of processing card payments for the merchant"
+    },
+    {
+        "name": "agent",
+        "type": "FLOAT",
+        "short_description": "Agent Fee",
+        "detailed_description": "the commission amount (in original currency) allocated to an agent or intermediary involved in the transaction or merchant/acquirer acquisition, based on the agreed revenue-sharing or partnership terms"
+    },
+    {
+        "name": "settlement",
+        "type": "FLOAT",
+        "short_description": "Settlement Fee_orig. currency",
+        "detailed_description": "the fee amount (in orig. currency) charged by the acquirer or payment provider for executing the settlement of funds"
+    },
+    {
+        "name": "fx",
+        "type": "FLOAT",
+        "short_description": "FX (rate reserve fee)_orig.currency",
+        "detailed_description": "the amount (in orig. curr.) reserved as a fee related to currency exchange rate differences during transaction processing"
+    },
+    {
+        "name": "frontshop",
+        "type": "FLOAT",
+        "short_description": "Frontshop Fee_orig. currency",
+        "detailed_description": "the fee amount charged to the merchant or partner in the original transaction currency, representing the front-end (merchant-facing) commission"
+    },
+    {
+        "name": "additional",
+        "type": "FLOAT",
+        "short_description": "Add. Fee_orig. currency",
+        "detailed_description": "an additional fee amount (in orig. curr.) applied to the transaction based on specific conditions or service types"
+    },
+    {
+        "name": "maximal",
+        "type": "FLOAT",
+        "short_description": "MAX Fee",
+        "detailed_description": "the maximum commission amount (in orig.curr.) charged or applicable per transaction or settlement, as defined in the acquirer's financial terms"
+    },
+    {
+        "name": "agent_fixed",
+        "type": "FLOAT",
+        "short_description": "Agent fixed Fee",
+        "detailed_description": "Flat fee charged or earned by an agent per transaction"
+    },
+    {
+        "name": "trx_currency",
+        "type": "STRING",
+        "short_description": "Transaction processing currency",
+        "detailed_description": "Currency in which the transaction is processed by the gateway"
+    },
+    {
+        "name": "trx_min",
+        "type": "FLOAT",
+        "short_description": "MIN Fee",
+        "detailed_description": "the minimum commission amount (in orig.curr.) charged or applicable per transaction or settlement, as defined in the acquirer's financial terms"
+    },
+    {
+        "name": "vat_type",
+        "type": "STRING",
+        "short_description": "VAT Type",
+        "detailed_description": "the classification of the applied VAT, indicating the tax treatment of the transaction (e.g., standard rate, reduced rate, zero-rated, or VAT-exempt), based on the service nature and jurisdiction"
+    },
+    {
+        "name": "vat",
+        "type": "FLOAT",
+        "short_description": "VAT Fee",
+        "detailed_description": "the value-added tax amount applied to commissions or service fees, calculated according to the applicable VAT rate and charged in compliance with tax regulations"
+    },
+    {
+        "name": "monthly_fee",
+        "type": "FLOAT",
+        "short_description": "Monthly fee_orig. currency",
+        "detailed_description": "the recurring service fee charged to the partner in the original transaction currency, representing monthly maintenance of the account"
+    },
+    {
+        "name": "item_id",
+        "type": "STRING",
+        "short_description": "Fee ordinal number",
+        "detailed_description": "ordinal number of the fee"
+    },
+    {
+        "name": "records",
+        "type": "INTEGER",
+        "short_description": "*not being used*",
+        "detailed_description": "-"
+    }
+]
