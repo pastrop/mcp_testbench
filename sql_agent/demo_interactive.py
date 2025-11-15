@@ -1,7 +1,8 @@
 """
-Demo script for the Text-to-SQL Agent
+Interactive Demo for Text-to-SQL Agent
 
-Run this to see the agent in action.
+This demo includes the human-in-the-loop clarification workflow.
+Run this to see the full interactive experience including ambiguity resolution.
 Set ANTHROPIC_API_KEY environment variable to enable query translation.
 """
 
@@ -31,27 +32,19 @@ class TeeOutput:
         self.log.close()
 
 
-def demo_schema_analysis():
-    """Demonstrate schema analysis and ambiguity detection."""
+def demo_schema_analysis_interactive(agent):
+    """Demonstrate schema analysis with interactive ambiguity resolution."""
     print("\n" + "=" * 80)
-    print("TEXT-TO-SQL AGENT DEMO")
+    print("TEXT-TO-SQL AGENT DEMO (INTERACTIVE)")
     print("=" * 80)
 
-    # Get the path to schema.json relative to this file
-    script_dir = Path(__file__).parent
-    schema_path = script_dir / "schema.json"
-
-    # Initialize agent
-    print("\n1. Initializing agent...")
-    agent = TextToSQLAgent(schema_path=str(schema_path), table_name="transactions")
-
     # Initialize and analyze schema
-    print("2. Loading and analyzing schema...")
+    print("\n1. Initializing agent and loading schema...")
     init_result = agent.initialize()
 
     if not init_result["success"]:
         print(f"❌ Error: {init_result['error']}")
-        return None
+        return False
 
     print(f"✅ Loaded {init_result['columns_loaded']} columns")
     print(f"✅ Found {init_result['ambiguities']['total']} potential ambiguities")
@@ -59,7 +52,7 @@ def demo_schema_analysis():
     print(f"   - Medium priority: {len(init_result['ambiguities']['medium'])}")
 
     # Get schema summary
-    print("\n3. Schema Summary:")
+    print("\n2. Schema Summary:")
     summary = agent.get_schema_summary()
     print(f"   Table: {summary['table_name']}")
     print(f"   Total columns: {summary['total_columns']}")
@@ -69,33 +62,34 @@ def demo_schema_analysis():
             print(f"     - {col_type}: {count}")
 
     # Show some ambiguities
-    print("\n4. Sample Ambiguities Detected:")
+    print("\n3. Sample Ambiguities Detected:")
     ambiguities = agent.get_ambiguities_for_review()
     for i, amb in enumerate(ambiguities[:3]):  # Show first 3
         print(f"\n   Ambiguity {i+1} [{amb['severity'].upper()}]:")
         print(f"   Reason: {amb['reason']}")
         print(f"   Affected columns: {', '.join([c['name'] for c in amb['columns']])}")
 
-    # Add example clarifications
-    print("\n5. Adding example clarifications...")
-    agent.add_clarification(
-        "amount_eur",
-        "This is the transaction amount in EUR after currency conversion"
-    )
-    agent.add_clarification(
-        "comission_eur",
-        "This is the total commission charged in EUR, including all fee components"
-    )
-    print(f"✅ Added {len(agent.schema_manager.clarifications)} clarifications")
+    # Interactive clarification session
+    print("\n4. Starting Interactive Clarification Session...")
+    print("=" * 80)
+    print("You will now be prompted to clarify ambiguities in the schema.")
+    print("This helps the agent generate more accurate SQL queries.")
+    print("=" * 80)
+
+    if init_result['ambiguities']['total'] > 0:
+        agent.interactive_clarification_session()
+        print(f"\n✅ Added {len(agent.schema_manager.clarifications)} clarifications")
+    else:
+        print("\n✅ No ambiguities found - schema is clear!")
 
     # Search columns
-    print("\n6. Searching for 'commission' columns...")
+    print("\n5. Searching for 'commission' columns...")
     results = agent.schema_manager.search_columns("commission")
     print(f"   Found {len(results)} matching columns:")
     for col in results[:5]:
         print(f"     - {col.name} ({col.type}): {col.short_description}")
 
-    return agent
+    return True
 
 
 def demo_query_translation(agent):
@@ -112,7 +106,7 @@ def demo_query_translation(agent):
     print("QUERY TRANSLATION DEMO")
     print("=" * 80)
 
-    # Example queries
+    # Example queries - same as automated demo
     queries = [
         "What is the total transaction amount in EUR for all approved transactions in the last month?",
         "Which merchants have the highest total commission fees across all their transactions?",
@@ -179,11 +173,11 @@ def demo_query_translation(agent):
 
 
 def main():
-    """Run the demo."""
+    """Run the interactive demo."""
     # Create output filename with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     script_dir = Path(__file__).parent
-    output_file = script_dir / f"demo_output_{timestamp}.txt"
+    output_file = script_dir / f"demo_interactive_output_{timestamp}.txt"
 
     # Set up output capture to both console and file
     tee = TeeOutput(output_file)
@@ -191,24 +185,34 @@ def main():
     sys.stdout = tee
 
     try:
-        print(f"Demo output is being saved to: {output_file.name}")
+        print(f"Interactive demo output is being saved to: {output_file.name}")
         print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-        # Demo schema analysis (no API key needed)
-        agent = demo_schema_analysis()
+        # Get the path to schema.json relative to this file
+        script_dir = Path(__file__).parent
+        schema_path = script_dir / "schema.json"
 
-        if agent:
+        # Initialize agent
+        agent = TextToSQLAgent(schema_path=str(schema_path), table_name="transactions")
+
+        # Demo schema analysis with interactive clarification
+        success = demo_schema_analysis_interactive(agent)
+
+        if success:
             # Demo query translation (requires API key)
             demo_query_translation(agent)
 
         print("\n" + "=" * 80)
-        print("Demo complete!")
+        print("Interactive Demo Complete!")
         print("=" * 80)
         print("\nTo use the agent in your own code:")
         print("  from agent import TextToSQLAgent")
         print("  agent = TextToSQLAgent('schema.json')")
         print("  agent.initialize()")
+        print("  agent.interactive_clarification_session()  # Optional")
         print("  result = agent.translate_query('your question here')")
+        print("\nTo run the automated demo (no user input):")
+        print("  python demo.py")
         print("\nTo run the MCP server:")
         print("  python mcp_server.py")
         print("=" * 80)
@@ -219,7 +223,7 @@ def main():
         # Restore stdout and close the file
         sys.stdout = original_stdout
         tee.close()
-        print(f"\n✅ Demo complete! Output saved to: {output_file}")
+        print(f"\n✅ Interactive demo complete! Output saved to: {output_file}")
 
 
 if __name__ == "__main__":

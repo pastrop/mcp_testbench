@@ -19,6 +19,10 @@ Skip this step if you only want to use schema analysis features.
 
 ## Step 2: Run the Demo
 
+You can run either the **automated** demo or the **interactive** demo:
+
+### Automated Demo (No User Input)
+
 ```bash
 cd /Users/alexsmirnoff/Documents/src/testbench
 uv run python sql_agent/demo.py
@@ -27,8 +31,31 @@ uv run python sql_agent/demo.py
 This will show you:
 - Schema loading and analysis
 - Ambiguity detection
+- Hardcoded example clarifications
 - Column searching
-- Query translation (if API key is set)
+- Query translation on 6 example queries (if API key is set)
+- Automatic query rebuilding on validation failures
+- **All output is automatically saved to `demo_output_YYYYMMDD_HHMMSS.txt`**
+
+Perfect for quick demonstrations and automated testing.
+
+### Interactive Demo (Human-in-the-Loop)
+
+```bash
+cd /Users/alexsmirnoff/Documents/src/testbench
+uv run python sql_agent/demo_interactive.py
+```
+
+This will show you:
+- Schema loading and analysis
+- Ambiguity detection
+- **Interactive prompts to clarify each ambiguity** (requires your input)
+- Column searching
+- Query translation on the same 6 example queries (if API key is set)
+- Automatic query rebuilding on validation failures
+- **All output is automatically saved to `demo_interactive_output_YYYYMMDD_HHMMSS.txt`**
+
+Use this to experience the full human-in-the-loop clarification workflow.
 
 ## Step 3: Run the Tests
 
@@ -183,7 +210,7 @@ for amb in ambiguities:
 
 **Solution**:
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
+export ANTHROPIC_API_KEY="anthropic key here"
 ```
 
 Or if you only need schema analysis, the agent will work without it.
@@ -249,24 +276,27 @@ testbench/
     ├── query_translator.py # SQL generation
     ├── mcp_server.py       # MCP server
     ├── test_agent.py       # Tests
-    ├── demo.py             # Demo script
+    ├── demo.py             # Automated demo (no user input)
+    ├── demo_interactive.py # Interactive demo (human-in-the-loop)
     ├── schema.json         # Your schema
     └── README.md           # Full documentation
 ```
 
 ## Next Steps
 
-1. ✅ Run the demo: `uv run python sql_agent/demo.py`
-2. ✅ Run the tests: `uv run python sql_agent/test_agent.py`
-3. ✅ Try translating your own queries
-4. ✅ Integrate into your application
-5. ✅ Run the MCP server for tool integration
+1. ✅ Run the automated demo: `uv run python sql_agent/demo.py`
+2. ✅ Run the interactive demo: `uv run python sql_agent/demo_interactive.py`
+3. ✅ Run the tests: `uv run python sql_agent/test_agent.py`
+4. ✅ Try translating your own queries
+5. ✅ Integrate into your application
+6. ✅ Run the MCP server for tool integration
 
 ## Resources
 
 - **Full Documentation**: `sql_agent/README.md`
 - **Project Summary**: `sql_agent/SUMMARY.md`
-- **Example Usage**: `sql_agent/demo.py`
+- **Automated Demo**: `sql_agent/demo.py`
+- **Interactive Demo**: `sql_agent/demo_interactive.py`
 - **API Reference**: See docstrings in source files
 
 ## Support
@@ -274,7 +304,7 @@ testbench/
 For questions or issues:
 1. Check `README.md` for detailed documentation
 2. Review test cases in `test_agent.py` for examples
-3. Run `demo.py` to see the agent in action
+3. Run `demo.py` (automated) or `demo_interactive.py` (human-in-the-loop) to see the agent in action
 
 ---
 

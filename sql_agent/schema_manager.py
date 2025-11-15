@@ -6,7 +6,7 @@ Detects ambiguities and potential duplicates in column names.
 """
 
 import json
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 from dataclasses import dataclass
 from collections import defaultdict
 import re

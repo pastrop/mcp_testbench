@@ -62,16 +62,70 @@ export ANTHROPIC_API_KEY="your-api-key-here"
 
 ### Command Line Interface
 
-Run the agent directly:
+#### Demo Modes
+
+The agent includes two demo modes to showcase different workflows:
+
+**1. Automated Demo (no user interaction):**
+
+```bash
+python demo.py
+```
+
+This runs a fully automated demonstration:
+1. Loads and analyzes the schema
+2. Displays detected ambiguities
+3. Applies hardcoded example clarifications
+4. Searches for columns
+5. Runs query translation on 6 example queries (if API key is set)
+6. Demonstrates automatic query rebuilding on validation failures
+7. Saves all output to `demo_output_YYYYMMDD_HHMMSS.txt`
+
+Perfect for CI/CD pipelines or automated testing where no user input is required.
+
+**2. Interactive Demo (human-in-the-loop):**
+
+```bash
+python demo_interactive.py
+```
+
+This runs the full interactive workflow:
+1. Loads and analyzes the schema
+2. Displays detected ambiguities
+3. **Prompts you to clarify each ambiguity interactively**
+4. Runs query translation on the same 6 example queries
+5. Demonstrates automatic query rebuilding on validation failures
+6. Saves all output to `demo_interactive_output_YYYYMMDD_HHMMSS.txt`
+
+Use this mode when you want to experience the human-in-the-loop clarification process.
+
+**Example interactive session:**
+```
+Ambiguity 1 [HIGH]:
+Reason: Potential duplicate columns with similar names
+Affected columns: merchant_id, merchant
+
+Would you like to clarify these columns? (y/n/skip): y
+
+Enter clarifications (format: column_name: clarification text)
+Type 'done' when finished.
+
+> merchant_id: This is the unique numeric identifier for the merchant
+> merchant: This is the merchant's display name
+> done
+
+✅ Added 2 clarifications
+```
+
+Both demos automatically create timestamped output files capturing all console output for later review.
+
+**Run the basic agent:**
 
 ```bash
 python agent.py
 ```
 
-This will:
-1. Load and analyze the schema
-2. Display detected ambiguities
-3. Run an example query translation
+This runs a simpler example with one query translation.
 
 ### Python API
 

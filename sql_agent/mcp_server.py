@@ -4,7 +4,7 @@ MCP Server for Text-to-SQL Agent
 Exposes the agent's functionality through FastMCP tools.
 """
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from agent import TextToSQLAgent
 from typing import Optional
 import json

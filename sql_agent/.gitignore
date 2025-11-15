@@ -44,6 +44,8 @@ htmlcov/
 
 # Generated files
 schema_clarified.json
+demo_output_*.txt
+demo_interactive_output_*.txt
 
 # OS
 .DS_Store

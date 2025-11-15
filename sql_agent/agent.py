@@ -6,9 +6,8 @@ user clarifications, and query translation.
 """
 
 from typing import Optional, Dict, Any, List
-from schema_manager import SchemaManager, SchemaAmbiguity
+from schema_manager import SchemaManager
 from query_translator import QueryTranslator
-import json
 
 
 class TextToSQLAgent:
@@ -175,20 +174,114 @@ class TextToSQLAgent:
 
         return result
 
+    def translate_query_with_retry(
+        self,
+        natural_language_query: str,
+        max_retries: int = 1,
+        return_details: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Translate a natural language query to SQL with automatic retry on validation failure.
+
+        Args:
+            natural_language_query: The user's question
+            max_retries: Maximum number of rebuild attempts (default: 1)
+            return_details: If True, return full details including explanation
+
+        Returns:
+            Dictionary containing SQL query and metadata including rebuild information
+        """
+        if not self.initialized:
+            raise RuntimeError("Agent not initialized. Call initialize() first.")
+
+        # Get enriched schema description
+        schema_description = self.schema_manager.get_enriched_schema_description()
+
+        # Initial translation attempt
+        result = self.query_translator.translate(
+            natural_language_query=natural_language_query,
+            schema_description=schema_description,
+            table_name=self.table_name
+        )
+
+        # Validate the query
+        if result.get("sql") and not result.get("error"):
+            validation = self.query_translator.validate_query(result["sql"])
+            result["validation"] = validation
+            result["retry_count"] = 0
+
+            # If validation failed and we have retries left, attempt to rebuild
+            if not validation["valid"] and max_retries > 0 and validation["errors"]:
+                retry_count = 0
+                while retry_count < max_retries and not result.get("validation", {}).get("valid"):
+                    retry_count += 1
+
+                    # Attempt to rebuild
+                    rebuild_result = self.query_translator.rebuild_query(
+                        natural_language_query=natural_language_query,
+                        failed_sql=result["sql"],
+                        validation_errors=result["validation"]["errors"],
+                        schema_description=schema_description,
+                        table_name=self.table_name
+                    )
+
+                    # Store original failed query for reference
+                    if retry_count == 1:
+                        result["original_sql"] = result["sql"]
+                        result["original_validation"] = result["validation"]
+
+                    # Update result with rebuild
+                    if not rebuild_result.get("error") and rebuild_result.get("sql"):
+                        result = rebuild_result
+                        # Validate the rebuilt query
+                        validation = self.query_translator.validate_query(result["sql"])
+                        result["validation"] = validation
+                        result["retry_count"] = retry_count
+
+                        if validation["valid"]:
+                            result["rebuild_successful"] = True
+                            break
+                    else:
+                        # Rebuild failed, keep original result
+                        result["rebuild_successful"] = False
+                        result["rebuild_error"] = rebuild_result.get("explanation")
+                        break
+
+                # Mark if we exhausted retries without success
+                if not result.get("validation", {}).get("valid"):
+                    result["rebuild_successful"] = False
+                    result["retry_count"] = retry_count
+
+        if not return_details:
+            # Return simplified response
+            return {
+                "sql": result.get("sql"),
+                "confidence": result.get("confidence"),
+                "valid": result.get("validation", {}).get("valid", False),
+                "rebuilt": result.get("rebuilt", False)
+            }
+
+        return result
+
     def process_query_with_feedback(
         self,
-        natural_language_query: str
+        natural_language_query: str,
+        auto_retry: bool = False
     ) -> Dict[str, Any]:
         """
         Process a query and return results formatted for user feedback.
 
         Args:
             natural_language_query: The user's question
+            auto_retry: If True, automatically retry failed validations
 
         Returns:
             Formatted results with SQL, explanation, and any warnings
         """
-        result = self.translate_query(natural_language_query)
+        if auto_retry:
+            result = self.translate_query_with_retry(natural_language_query, max_retries=1)
+        else:
+            result = self.translate_query(natural_language_query)
 
         response = {
             "query": natural_language_query,
@@ -206,6 +299,15 @@ class TextToSQLAgent:
             "warnings": result.get("warnings", []),
             "validation": result.get("validation", {})
         })
+
+        # Add rebuild information if present
+        if result.get("rebuilt"):
+            response["rebuilt"] = True
+            response["retry_count"] = result.get("retry_count", 0)
+            response["rebuild_successful"] = result.get("rebuild_successful", False)
+            if result.get("original_sql"):
+                response["original_sql"] = result["original_sql"]
+                response["original_validation"] = result.get("original_validation", {})
 
         return response
 

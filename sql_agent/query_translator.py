@@ -5,6 +5,7 @@ Translates natural language queries to GoogleSQL using Claude API.
 """
 
 import os
+import re
 from typing import Optional, Dict, Any
 from anthropic import Anthropic
 
@@ -203,14 +204,16 @@ Generate the SQL query following the format specified in the system prompt.
         sql_upper = sql_query.upper()
 
         # Check for JOINs (should not be present)
-        if 'JOIN' in sql_upper:
+        # Use word boundary to avoid false positives like "DISJOINT"
+        if re.search(r'\bJOIN\b', sql_upper):
             validation["errors"].append("Query contains JOIN - only single table queries are allowed")
             validation["valid"] = False
 
-        # Check for destructive operations
+        # Check for destructive operations using word boundaries
+        # This prevents false positives like "CREATE" in "TIMESTAMP_TRUNC"
         destructive_ops = ['DROP', 'DELETE', 'TRUNCATE', 'ALTER', 'CREATE']
         for op in destructive_ops:
-            if op in sql_upper:
+            if re.search(rf'\b{op}\b', sql_upper):
                 validation["errors"].append(f"Destructive operation {op} not allowed")
                 validation["valid"] = False
 
@@ -225,3 +228,88 @@ Generate the SQL query following the format specified in the system prompt.
                 validation["warnings"].append(f"Suspicious pattern found: {pattern}")
 
         return validation
+
+    def rebuild_query(
+        self,
+        natural_language_query: str,
+        failed_sql: str,
+        validation_errors: list,
+        schema_description: str,
+        table_name: str = "transactions"
+    ) -> Dict[str, Any]:
+        """
+        Rebuild a query that failed validation.
+
+        Args:
+            natural_language_query: Original user question
+            failed_sql: The SQL that failed validation
+            validation_errors: List of validation error messages
+            schema_description: Schema description
+            table_name: Table name
+
+        Returns:
+            Dictionary with rebuilt query result
+        """
+        # Build a specific prompt for query rebuilding
+        rebuild_prompt = f"""The following SQL query failed validation. Please fix it according to the constraints.
+
+ORIGINAL QUESTION: {natural_language_query}
+
+FAILED SQL:
+```sql
+{failed_sql}
+```
+
+VALIDATION ERRORS:
+{chr(10).join(f"- {error}" for error in validation_errors)}
+
+CONSTRAINTS YOU MUST FOLLOW:
+1. NO JOIN operations - this is a SINGLE TABLE query only
+2. NO destructive operations (DROP, DELETE, TRUNCATE, ALTER, CREATE statements)
+3. Query must start with SELECT
+4. Use GoogleSQL (BigQuery) syntax only
+
+Please rewrite the SQL query to satisfy these constraints while still answering the original question.
+If the question REQUIRES a JOIN (multiple tables), explain that it cannot be answered with a single table.
+
+Return your response in the same format as before:
+SQL:
+```sql
+[Fixed query here]
+```
+
+EXPLANATION:
+[Explain what you changed and why]
+
+CONFIDENCE: [high/medium/low]
+
+WARNINGS:
+[Any warnings or limitations]
+"""
+
+        system_prompt = self._build_system_prompt(schema_description, table_name)
+
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=2000,
+                temperature=0,  # Keep deterministic for fixes
+                system=system_prompt,
+                messages=[
+                    {"role": "user", "content": rebuild_prompt}
+                ]
+            )
+
+            result = self._parse_response(response.content[0].text)
+            result["rebuilt"] = True
+            return result
+
+        except Exception as e:
+            return {
+                "sql": None,
+                "explanation": f"Error rebuilding query: {str(e)}",
+                "confidence": "low",
+                "warnings": [str(e)],
+                "error": True,
+                "rebuilt": False
+            }
