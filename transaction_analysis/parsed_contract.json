@@ -1,0 +1,238 @@
+{
+  "document_info": {
+    "document_number": "VSP-040823-20",
+    "dated": "25.08.2023",
+    "date_hereof": "01.12.2025",
+    "company": "Faro Entertainment Europe Limited"
+  },
+  "incoming_fees": {
+    "crypto": {
+      "usdt_btc_payment": {
+        "rate": 0.0,
+        "currency": [
+          "USDT",
+          "BTC"
+        ],
+        "calculation_method": "per transaction"
+      }
+    }
+  },
+  "card_fees": {
+    "eur_ww": {
+      "wl_rate": 0.06,
+      "fixed_fee": 0.15,
+      "refund_fee": 1,
+      "chb_fee": 50,
+      "currency": "EUR",
+      "region": "WW"
+    },
+    "eur_eea": {
+      "wl_rate": 0.06,
+      "fixed_fee": 0.15,
+      "refund_fee": 1,
+      "chb_fee": 50,
+      "currency": "EUR",
+      "region": "EEA"
+    },
+    "usd_ww": {
+      "wl_rate": 0.062,
+      "fixed_fee": 0.15,
+      "refund_fee": 5,
+      "chb_fee": 70,
+      "currency": "USD",
+      "region": "WW"
+    },
+    "nok_eea": {
+      "wl_rate": 0.067,
+      "fixed_fee": 1.8,
+      "refund_fee": 5,
+      "chb_fee": 70,
+      "currency": "NOK",
+      "region": "EEA"
+    },
+    "sek_eea": {
+      "wl_rate": 0.067,
+      "fixed_fee": 1.75,
+      "refund_fee": 5,
+      "chb_fee": 70,
+      "currency": "SEK",
+      "region": "EEA"
+    },
+    "gbp_uk": {
+      "wl_rate": 0.067,
+      "fixed_fee": 0.15,
+      "refund_fee": 1,
+      "chb_fee": 50,
+      "currency": "GBP",
+      "region": "UK"
+    }
+  },
+  "excessive_chargeback_fees": {
+    "conditions": "if monthly CB volume > 1.0% and CB count > 100",
+    "fees": {
+      "eur": 100,
+      "usd": 120,
+      "nok": 1200,
+      "sek": 1100,
+      "gbp": 100
+    },
+    "calculation_method": "cumulative chargeback-to-sales ratio or count for previous processing month"
+  },
+  "apm_open_banking_fees": {
+    "sofort_uber": {
+      "wl_rate": 0.035,
+      "fixed_fee": 0.3,
+      "refund_fee": 1,
+      "currency": "EUR",
+      "region": "EEA"
+    },
+    "open_banking_gbp": {
+      "wl_rate": 0.03,
+      "fixed_fee": 0.3,
+      "refund_fee": 1,
+      "currency": "GBP",
+      "region": "UK"
+    },
+    "open_banking_turnover_tiers": {
+      "tier_1_0_to_500k": {
+        "wl_rate": 0.02,
+        "fixed_fee": 0.7,
+        "refund_fee": 1,
+        "currency": "EUR",
+        "region": "EEA"
+      },
+      "tier_2_500k_to_1m": {
+        "wl_rate": 0.017,
+        "fixed_fee": 0.5,
+        "refund_fee": 1,
+        "currency": "EUR",
+        "region": "EEA"
+      },
+      "tier_3_over_1m": {
+        "wl_rate": 0.015,
+        "fixed_fee": 0.3,
+        "refund_fee": 1,
+        "currency": "EUR",
+        "region": "EEA"
+      }
+    },
+    "open_banking_own_account": {
+      "ftd_fee": 1.5,
+      "fixed_fee": 0.3,
+      "refund_fee": 1,
+      "currency": "EUR",
+      "region": "EEA"
+    },
+    "apple_pay_google_pay_eur": {
+      "wl_rate": 0.06,
+      "fixed_fee": 0.15,
+      "refund_fee": 1,
+      "chb_fee": 50,
+      "currency": "EUR",
+      "region": "EEA"
+    },
+    "apple_pay_google_pay_gbp": {
+      "wl_rate": 0.06,
+      "fixed_fee": 0.3,
+      "refund_fee": 1,
+      "chb_fee": 50,
+      "currency": "GBP",
+      "region": "UK"
+    },
+    "blik_turnover_tiers": {
+      "tier_1_0_to_1m": {
+        "wl_rate": 0.065,
+        "fixed_fee": 0.5,
+        "refund_fee": 5,
+        "currency": "PLN",
+        "region": "EEA"
+      },
+      "tier_2_1m_to_2m": {
+        "wl_rate": 0.06,
+        "fixed_fee": 0.5,
+        "refund_fee": 5,
+        "currency": "PLN",
+        "region": "EEA"
+      },
+      "tier_3_2m_to_3m": {
+        "wl_rate": 0.055,
+        "fixed_fee": 0.5,
+        "refund_fee": 5,
+        "currency": "PLN",
+        "region": "EEA"
+      }
+    }
+  },
+  "outgoing_fees": {
+    "cards": {
+      "eur_mc_ww": {
+        "rate": 0.035,
+        "payout_oct_fix": 1,
+        "currency": "EUR",
+        "region": "WW"
+      },
+      "eur_visa_ww": {
+        "rate": 0.035,
+        "payout_oct_fix": 1,
+        "currency": "EUR",
+        "region": "WW"
+      },
+      "usd_ww": {
+        "rate": 0.043,
+        "payout_oct_fix": 1,
+        "currency": "USD",
+        "region": "WW"
+      },
+      "kzt_domestic": {
+        "rate": 0.15,
+        "payout_oct_min": 300,
+        "currency": "KZT",
+        "region": "Domestic"
+      }
+    },
+    "sepa": {
+      "balance_from_processing": {
+        "payout_oct_fix": 2.5,
+        "currency": "EUR",
+        "region": "EEA"
+      },
+      "balance_from_crypto": {
+        "payout_oct_fix": 2.5,
+        "currency": "EUR",
+        "region": "EEA"
+      }
+    }
+  },
+  "settlement_fees": {
+    "internal_settlement": {
+      "rate": 0.0,
+      "calculation_method": "internal transfers"
+    },
+    "external_settlement": {
+      "rate": 0.005,
+      "minimum_fee": 100,
+      "currency": "EUR",
+      "calculation_method": "external settlement transfers"
+    }
+  },
+  "currency_exchange_fees": {
+    "fiat_currency_exchange": {
+      "rate": 0.005,
+      "calculation_method": "upfront per exchange operation",
+      "note": "Exchange rates set by Verser Pay daily"
+    },
+    "cryptocurrency_exchange": {
+      "rate": 0.005,
+      "calculation_method": "upfront per exchange operation",
+      "note": "Exchange rates set by Kraken"
+    }
+  },
+  "processing_balance_conditions": {
+    "rolling_reserve": null,
+    "security_deposit": null,
+    "hold_period": "3 days",
+    "settlement_cycle": "Daily",
+    "settlement_currency": "EUR"
+  },
+  "source_file": "/content/faro_test.pdf"
+}
