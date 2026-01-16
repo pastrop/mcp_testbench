@@ -136,23 +136,10 @@ Transactions with confidence below threshold are marked as "QUESTIONABLE".
       "fee_name": "Remuneration",
       "amount": 0.038
     },
-    {
-      "fee_name": "Chargeback",
-      "amount": 50
-    },
-    {
-      "fee_name": "Refund",
-      "amount": 5
-    },
-    {
-      "fee_name": "Rolling Reserve",
-      "amount": 0.1,
-      "maximum_cap": 37500
-    }
-  ],
+
   "payment_methods": {
-    "supported_cards": ["MasterCard", "Maestro"],
-    "currencies": ["EUR", "GBP", "USD", "AUD", "NOK"]
+    "supported_cards": [...],
+    "currencies": [...]
   }
 }
 ```
