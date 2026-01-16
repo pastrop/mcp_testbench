@@ -1,0 +1,113 @@
+{
+  "fees_and_rates": [
+    {
+      "fee_name": "Payment Processing Fee",
+      "amount": "3.8%",
+      "amount_decimal": 0.038,
+      "calculation_method": "per transaction",
+      "currency": "All authorized currencies (EUR, GBP, USD, AUD, NOK)",
+      "conditions": "Standard processing rate"
+    },
+    {
+      "fee_name": "Chargeback Cost",
+      "amount": "50 EUR",
+      "calculation_method": "per chargeback incident",
+      "currency": "EUR",
+      "conditions": "Applied when chargeback occurs"
+    },
+    {
+      "fee_name": "Refund Cost",
+      "amount": "5 EUR",
+      "calculation_method": "per refund transaction",
+      "currency": "EUR",
+      "conditions": "Applied for each refund processed"
+    },
+    {
+      "fee_name": "Rolling Reserve",
+      "amount": "10%",
+      "amount_decimal": 0.1,
+      "calculation_method": "withheld from each transaction",
+      "currency": "Transaction currency",
+      "conditions": "Held for 180 days, maximum 37,500 EUR",
+      "holding_period": "180 days"
+    },
+    {
+      "fee_name": "Chargeback Limit",
+      "amount": "0.5%",
+      "amount_decimal": 0.005,
+      "calculation_method": "percentage of total transactions",
+      "conditions": "Maximum allowed chargeback ratio for reporting period"
+    }
+  ],
+  "transaction_limits": [
+    {
+      "limit_type": "Minimum Payment",
+      "amount": "1 EUR",
+      "currency": "EUR"
+    },
+    {
+      "limit_type": "Maximum Single Card Monthly Limit",
+      "amount": "5000 EUR",
+      "currency": "EUR",
+      "conditions": "Per card per month for successful transactions"
+    }
+  ],
+  "service_conditions": [
+    {
+      "condition": "Payment Settlement",
+      "frequency": "Every day basis",
+      "method": "SEPA"
+    },
+    {
+      "condition": "Authorization Currencies",
+      "supported": [
+        "EUR",
+        "GBP",
+        "USD",
+        "AUD",
+        "NOK"
+      ]
+    },
+    {
+      "condition": "Billing Currency",
+      "currency": "EUR"
+    },
+    {
+      "condition": "Card Types Accepted",
+      "types": [
+        "MasterCard",
+        "Maestro"
+      ]
+    },
+    {
+      "condition": "Security Requirement",
+      "requirement": "3D Secure Only"
+    },
+    {
+      "condition": "Geographic Coverage",
+      "regions": [
+        "UK",
+        "EU"
+      ],
+      "note": "Other countries available on request"
+    }
+  ],
+  "additional_fees": [
+    {
+      "fee_name": "Rejected Transaction Commission",
+      "amount": "N/A",
+      "note": "Not applicable - no fee for rejected transactions"
+    },
+    {
+      "fee_name": "Refund Limit",
+      "amount": "N/A",
+      "note": "No specified limit"
+    }
+  ],
+  "contract_details": {
+    "agreement_number": "2025/2110-03",
+    "effective_date": "21.10.2025",
+    "provider": "FINTHESIS LTD",
+    "merchant": "DIRMENION LTD"
+  }
+}
