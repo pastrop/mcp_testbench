@@ -82,7 +82,7 @@ def load_contract(file_path: str) -> DintaresContract:
 
     # Extract specific fees
     remuneration = _find_fee(fee_lookup, [
-        'remuneration', 'processing', 'commission'
+        'remuneration', 'processing', 'commission', 'payment processing'
     ])
     chargeback = _find_fee(fee_lookup, ['chargeback'])
     refund = _find_fee(fee_lookup, ['refund'])
@@ -91,17 +91,17 @@ def load_contract(file_path: str) -> DintaresContract:
     # Extract payment methods
     payment_methods = data.get('payment_methods', {})
 
-    # Build contract model
+    # Build contract model with parsed amounts
     contract_data = {
-        'remuneration_rate': remuneration.get('amount', 0.038),
-        'chargeback_cost': chargeback.get('amount', 50),
-        'refund_cost': refund.get('amount', 5),
-        'rolling_reserve_rate': rolling_reserve.get('amount', 0.1),
-        'rolling_reserve_days': 180,  # Default from spec
-        'rolling_reserve_cap': rolling_reserve.get('maximum_cap', 37500),
-        'chargeback_limit': _find_fee(fee_lookup, ['chargeback limit']).get('amount', 0.005),
-        'minimum_payment': _find_fee(fee_lookup, ['minimum payment', 'minimum']).get('amount', 1),
-        'monthly_card_limit': _find_fee(fee_lookup, ['monthly card limit', 'monthly limit']).get('amount', 5000),
+        'remuneration_rate': _parse_fee_amount(remuneration) if remuneration else 0.038,
+        'chargeback_cost': _parse_fee_amount(chargeback) if chargeback else 50,
+        'refund_cost': _parse_fee_amount(refund) if refund else 5,
+        'rolling_reserve_rate': _parse_fee_amount(rolling_reserve) if rolling_reserve else 0.1,
+        'rolling_reserve_days': rolling_reserve.get('holding_period_days', 180) if rolling_reserve else 180,
+        'rolling_reserve_cap': _parse_rr_cap(rolling_reserve) if rolling_reserve else 37500,
+        'chargeback_limit': _parse_fee_amount(_find_fee(fee_lookup, ['chargeback limit'])) if _find_fee(fee_lookup, ['chargeback limit']) else 0.005,
+        'minimum_payment': _parse_fee_amount(_find_fee(fee_lookup, ['minimum payment', 'minimum'])) if _find_fee(fee_lookup, ['minimum payment', 'minimum']) else 1,
+        'monthly_card_limit': _parse_fee_amount(_find_fee(fee_lookup, ['monthly card limit', 'monthly limit'])) if _find_fee(fee_lookup, ['monthly card limit', 'monthly limit']) else 5000,
         'supported_cards': payment_methods.get('supported_cards', []),
         'currencies': payment_methods.get('currencies', []),
     }
@@ -110,6 +110,94 @@ def load_contract(file_path: str) -> DintaresContract:
         return DintaresContract(**contract_data)
     except Exception as e:
         raise ValueError(f"Failed to create contract model: {e}")
+
+
+def _parse_rr_cap(fee_data: Dict[str, Any]) -> float:
+    """
+    Parse rolling reserve cap from various formats.
+
+    Checks:
+    - 'maximum_cap' field
+    - 'max_cap' field
+    - 'conditions' field for "maximum X EUR" pattern
+
+    Args:
+        fee_data: Rolling reserve fee dictionary
+
+    Returns:
+        Cap amount as float (default: 37500)
+    """
+    # Check for explicit cap fields
+    if 'maximum_cap' in fee_data:
+        return float(fee_data['maximum_cap'])
+    if 'max_cap' in fee_data:
+        return float(fee_data['max_cap'])
+
+    # Parse from conditions text
+    conditions = str(fee_data.get('conditions', ''))
+
+    # Look for patterns like "maximum 37,500 EUR" or "max 37500"
+    import re
+    patterns = [
+        r'maximum\s+([\d,]+)',
+        r'max\s+([\d,]+)',
+        r'cap\s+([\d,]+)',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, conditions.lower())
+        if match:
+            # Remove commas and convert to float
+            cap_str = match.group(1).replace(',', '')
+            try:
+                return float(cap_str)
+            except ValueError:
+                continue
+
+    # Default cap
+    return 37500.0
+
+
+def _parse_fee_amount(fee_data: Dict[str, Any]) -> float:
+    """
+    Parse fee amount from various formats.
+
+    Handles:
+    - Decimal values in 'amount_decimal' field
+    - Percentage strings: "3.8%" → 0.038
+    - Currency strings: "50 EUR" → 50
+    - Plain numbers: 50 → 50
+
+    Args:
+        fee_data: Fee dictionary with 'amount' or 'amount_decimal'
+
+    Returns:
+        Parsed amount as float
+    """
+    # Prefer amount_decimal if available
+    if 'amount_decimal' in fee_data:
+        return float(fee_data['amount_decimal'])
+
+    # Parse amount string
+    amount_str = str(fee_data.get('amount', 0))
+
+    # Remove common symbols
+    cleaned = amount_str.strip().replace('EUR', '').replace('GBP', '').replace('USD', '').replace('AUD', '').replace('NOK', '').strip()
+
+    # Handle percentage
+    if '%' in cleaned:
+        # Remove % and divide by 100
+        cleaned = cleaned.replace('%', '').strip()
+        try:
+            return float(cleaned) / 100.0
+        except ValueError:
+            return 0.0
+
+    # Handle plain number
+    try:
+        return float(cleaned)
+    except ValueError:
+        return 0.0
 
 
 def _find_fee(fee_lookup: Dict[str, Any], search_terms: list[str]) -> Dict[str, Any]:
