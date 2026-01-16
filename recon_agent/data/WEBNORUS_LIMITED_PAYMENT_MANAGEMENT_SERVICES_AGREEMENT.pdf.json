@@ -1,0 +1,120 @@
+{
+  "company_fees": {
+    "transaction_fees": [
+      {
+        "fee_name": "Internet acquiring EUR",
+        "fee_type": "Transaction fee",
+        "amount": "3.8%",
+        "amount_decimal": 0.038,
+        "currency": "EUR",
+        "calculation_method": "Per transaction",
+        "payment_method": "Internet acquiring",
+        "conditions": "Standard internet acquiring transactions in EUR"
+      },
+      {
+        "fee_name": "Internet acquiring GBP",
+        "fee_type": "Transaction fee",
+        "amount": "3.8%",
+        "amount_decimal": 0.038,
+        "currency": "GBP",
+        "calculation_method": "Per transaction",
+        "payment_method": "Internet acquiring",
+        "conditions": "Standard internet acquiring transactions in GBP"
+      },
+      {
+        "fee_name": "Apple Pay EUR",
+        "fee_type": "Transaction fee",
+        "amount": "5%",
+        "amount_decimal": 0.05,
+        "currency": "EUR",
+        "calculation_method": "Per transaction",
+        "payment_method": "Apple Pay",
+        "conditions": "Apple Pay transactions in EUR"
+      },
+      {
+        "fee_name": "Google Pay EUR",
+        "fee_type": "Transaction fee",
+        "amount": "5%",
+        "amount_decimal": 0.05,
+        "currency": "EUR",
+        "calculation_method": "Per transaction",
+        "payment_method": "Google Pay",
+        "conditions": "Google Pay transactions in EUR"
+      },
+      {
+        "fee_name": "Apple Pay GBP",
+        "fee_type": "Transaction fee",
+        "amount": "5%",
+        "amount_decimal": 0.05,
+        "currency": "GBP",
+        "calculation_method": "Per transaction",
+        "payment_method": "Apple Pay",
+        "conditions": "Apple Pay transactions in GBP"
+      },
+      {
+        "fee_name": "Google Pay GBP",
+        "fee_type": "Transaction fee",
+        "amount": "5%",
+        "amount_decimal": 0.05,
+        "currency": "GBP",
+        "calculation_method": "Per transaction",
+        "payment_method": "Google Pay",
+        "conditions": "Google Pay transactions in GBP"
+      }
+    ],
+    "chargeback_fees": [
+      {
+        "fee_name": "Chargeback fee",
+        "fee_type": "Chargeback processing fee",
+        "amount": "50 EUR",
+        "currency": "EUR",
+        "calculation_method": "Per chargeback occurrence",
+        "conditions": "Applied for each chargeback processed"
+      }
+    ],
+    "refund_fees": [
+      {
+        "fee_name": "Refund fee",
+        "fee_type": "Refund processing fee",
+        "amount": "5 EUR",
+        "currency": "EUR",
+        "calculation_method": "Per refund transaction",
+        "conditions": "Applied for each refund processed"
+      }
+    ],
+    "rolling_reserve": [
+      {
+        "fee_name": "Rolling Reserve (RR)",
+        "fee_type": "Risk reserve fee",
+        "amount": "10%",
+        "amount_decimal": 0.1,
+        "maximum_cap": "37,500 EUR",
+        "currency": "EUR",
+        "calculation_method": "Percentage of customer's total turnover",
+        "conditions": "Held in non-interest-bearing account for specified duration, released 180 days after agreement termination if no sanctions or fees imposed by MasterCard"
+      }
+    ]
+  },
+  "bank_charges": {
+    "responsibility": "Company pays all bank charges and commissions accrued by both Company's bank and Merchant's bank"
+  },
+  "payment_terms": {
+    "settlement_currency": "EUR",
+    "settlement_timing": "Next Business Day for previous Business Day transactions",
+    "currency_conversion": "At Company's cost using Bank of England selling exchange rate published at https://www.bankofengland.co.uk"
+  },
+  "merchant_territories": [
+    "EU",
+    "GB"
+  ],
+  "supported_currencies": [
+    "EUR",
+    "GBP"
+  ],
+  "effective_date": "2025-09-02",
+  "agreement_term": {
+    "initial_term": "1 year",
+    "renewal": "Automatic renewal for next 1 year unless terminated",
+    "termination_notice": "30 days written notice required"
+  }
+}
