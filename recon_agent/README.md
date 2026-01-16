@@ -1,13 +1,12 @@
-# DINTARES Fee Verification Agent
+# Fee Verification Agent
 
-Transaction fee verification agent for DINTARES contract compliance.
+Transaction fee verification agent for contract compliance.
 
 ## Features
 
 - Parse Excel files with Russian and English headers
 - Auto-detect fee columns with confidence scoring
-- Verify all fee types: Remuneration (3.8%), Chargeback (€50), Refund (€5), Rolling Reserve (10%)
-- Rolling Reserve tracking with €37,500 cap and 180-day holding
+- Verify all fee types
 - Decimal precision for accurate monetary calculations
 - Generate structured text reports with ASCII tables
 - Export JSON reports for machine processing
