@@ -72,9 +72,16 @@ def load_contract(file_path: str) -> DintaresContract:
     # Extract fee information - handle multiple contract formats
     fee_lookup: Dict[str, Any] = {}
 
-    # Format 1: Single "fees_and_rates" array or nested dict
+    # Determine the root key for fees (either 'fees_and_rates' or 'company_fees')
+    fee_root_key = None
     if 'fees_and_rates' in data:
-        fees_and_rates = data.get('fees_and_rates', [])
+        fee_root_key = 'fees_and_rates'
+    elif 'company_fees' in data:
+        fee_root_key = 'company_fees'
+
+    # Format 1: Single "fees_and_rates" or "company_fees" array or nested dict
+    if fee_root_key:
+        fees_and_rates = data.get(fee_root_key, [])
 
         # Check if it's a list (Format 1A) or dict (Format 1B/1C - nested)
         if isinstance(fees_and_rates, list):
@@ -199,18 +206,22 @@ def load_contract(file_path: str) -> DintaresContract:
             if not currencies:
                 currencies = supported_curr.get('currencies', [])
 
-    # Check nested locations for supported_currencies (QUANTESSA format)
-    if not currencies and 'fees_and_rates' in data and isinstance(data['fees_and_rates'], dict):
-        if 'settlement_details' in data['fees_and_rates']:
-            settlement = data['fees_and_rates']['settlement_details']
-            if isinstance(settlement, dict) and 'supported_currencies' in settlement:
-                currencies = settlement['supported_currencies']
+    # Check nested locations for supported_currencies
+    if not currencies:
+        # Check under fees_and_rates or company_fees
+        fee_root = data.get('fees_and_rates') or data.get('company_fees')
+        if fee_root and isinstance(fee_root, dict):
+            # QUANTESSA format: settlement_details
+            if 'settlement_details' in fee_root:
+                settlement = fee_root['settlement_details']
+                if isinstance(settlement, dict) and 'supported_currencies' in settlement:
+                    currencies = settlement['supported_currencies']
 
-        # Check approved_terms for currencies (RENAMESTRA format)
-        if not currencies and 'approved_terms' in data['fees_and_rates']:
-            approved_terms = data['fees_and_rates']['approved_terms']
-            if isinstance(approved_terms, dict) and 'currencies' in approved_terms:
-                currencies = approved_terms['currencies']
+            # RENAMESTRA format: approved_terms
+            if not currencies and 'approved_terms' in fee_root:
+                approved_terms = fee_root['approved_terms']
+                if isinstance(approved_terms, dict) and 'currencies' in approved_terms:
+                    currencies = approved_terms['currencies']
 
     # Extract limits from transaction_limits or payment_conditions if present
     minimum_payment_value = 1

@@ -137,7 +137,7 @@ Examples:
 
     # Banner
     print("=" * 60)
-    print("DINTARES FEE VERIFICATION AGENT")
+    print("FEE VERIFICATION AGENT")
     print("=" * 60)
 
     try:
