@@ -46,13 +46,13 @@ def discover_contract_file(data_dir: str = "data") -> str:
 
 def load_contract(file_path: str) -> DintaresContract:
     """
-    Load and parse DINTARES contract from JSON file.
+    Load and parse a contract from JSON file.
 
     Args:
         file_path: Path to the contract JSON file
 
     Returns:
-        DintaresContract: Parsed and validated contract
+        Contract: Parsed and validated contract
 
     Raises:
         FileNotFoundError: If contract file doesn't exist

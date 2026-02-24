@@ -22,7 +22,7 @@ from agent.tools.report_generator import (
 
 class DintaresFeeVerificationAgent:
     """
-    DINTARES fee verification agent.
+    Fee verification agent.
 
     Coordinates all tools to verify transaction fees against contract terms.
     """

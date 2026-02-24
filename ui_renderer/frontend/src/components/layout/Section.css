@@ -1,0 +1,19 @@
+.section {
+  margin-bottom: var(--spacing-2xl);
+}
+
+.section__title {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--color-gray-900);
+  margin-bottom: var(--spacing-md);
+}
+
+.section__description {
+  color: var(--color-gray-600);
+  margin-bottom: var(--spacing-lg);
+}
+
+.section__content {
+  /* Content spacing handled by children */
+}

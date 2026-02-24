@@ -9,7 +9,33 @@ dist/
 wheels/
 *.egg-info
 .DS_Store
+
 # Virtual environments
 .venv
-#folders
+venv/
+ENV/
+
+# Environment files (API keys, secrets)
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# OS
+Thumbs.db
+
+# Folders
 papers/
+data/
+output/

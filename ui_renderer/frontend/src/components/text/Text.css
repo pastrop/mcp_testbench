@@ -1,0 +1,23 @@
+.text {
+  margin: 0 0 var(--spacing-md);
+  line-height: 1.6;
+}
+
+.text--body {
+  font-size: 1rem;
+  color: var(--color-gray-700);
+}
+
+.text--small {
+  font-size: 0.875rem;
+  color: var(--color-gray-600);
+}
+
+.text--large {
+  font-size: 1.125rem;
+  color: var(--color-gray-700);
+}
+
+.text--muted {
+  color: var(--color-gray-500);
+}
