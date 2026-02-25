@@ -10,6 +10,7 @@ class QueryCategory(Enum):
 
     CONTRACT_INFO = "contract_info"
     TRANSACTION_ANALYSIS = "transaction_analysis"
+    COMBINED_ANALYSIS = "combined_analysis"
     OTHER = "other"
 
 
@@ -17,27 +18,35 @@ CLASSIFICATION_PROMPT = """You are a query classifier for a financial analysis s
 
 Classify the user's query into ONE of these categories:
 
-1. CONTRACT_INFO - User is asking about rates, fees, financial terms, or any information from a contract.
+1. CONTRACT_INFO - User is asking ONLY about rates, fees, financial terms, or information from a contract.
    Examples:
    - "What are the rates in the Finthesis contract?"
    - "Show me the fees for Skinvault"
    - "What's the rolling reserve for Blogwizarro?"
    - "Tell me about the Webnorus agreement terms"
 
-2. TRANSACTION_ANALYSIS - User wants to analyze transaction data, identify rate clusters, or understand commission structures from Excel files.
+2. TRANSACTION_ANALYSIS - User wants to ONLY analyze transaction data, identify rate clusters, or understand commission structures from Excel files.
    Examples:
    - "Analyze the Blogwizarro transactions"
    - "What commission rates are in the codedtea file?"
    - "Show me the rate clusters for lingo ventures payouts"
    - "Help me understand the fees in the acquiring report"
 
-3. OTHER - Anything that doesn't fit the above categories.
+3. COMBINED_ANALYSIS - User wants BOTH contract information AND transaction analysis, or wants to compare contractual rates with actual transaction fees.
+   Examples:
+   - "Give me the contractual fee for vendor X and compare with their transactions"
+   - "What's the contractual rate for Blogwizarro and what rates are in their transaction table?"
+   - "Compare the contract rates with actual transaction fees for codedtea"
+   - "Show me the agreed rates and actual rates for lingo ventures"
+   - "Are the transaction fees matching the contract for Finthesis?"
+
+4. OTHER - Anything that doesn't fit the above categories.
    Examples:
    - "Hello"
    - "What can you do?"
    - "How does the weather look?"
 
-Respond with ONLY the category name: CONTRACT_INFO, TRANSACTION_ANALYSIS, or OTHER
+Respond with ONLY the category name: CONTRACT_INFO, TRANSACTION_ANALYSIS, COMBINED_ANALYSIS, or OTHER
 
 User query: {query}
 
@@ -68,7 +77,10 @@ def classify_query(client: anthropic.Anthropic, query: str) -> QueryCategory:
     # Extract the classification from the response
     classification_text = response.content[0].text.strip().upper()
 
-    if "CONTRACT" in classification_text:
+    # Check for COMBINED first since it contains both "CONTRACT" and "TRANSACTION" keywords
+    if "COMBINED" in classification_text:
+        return QueryCategory.COMBINED_ANALYSIS
+    elif "CONTRACT" in classification_text:
         return QueryCategory.CONTRACT_INFO
     elif "TRANSACTION" in classification_text:
         return QueryCategory.TRANSACTION_ANALYSIS

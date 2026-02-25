@@ -12,6 +12,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from .classifier import QueryCategory, classify_query, get_entity_from_query
+from .programmatic_agent import run_combined_analysis
 
 # Project paths
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -846,6 +847,36 @@ class FinancialAgent:
         formatted = self._format_transaction_analysis(analysis_result)
         return f"\n📁 File: {Path(file_path).name}{formatted}"
 
+    async def handle_combined_query(self, query: str) -> str:
+        """Handle queries that require both contract lookup and transaction analysis.
+
+        Uses the programmatic tool calling agent to orchestrate multiple tools
+        and provide a combined analysis comparing contractual rates with actual
+        transaction fees.
+
+        Args:
+            query: The user's query requesting combined analysis.
+
+        Returns:
+            Response string with combined analysis results.
+        """
+        print("\n🔄 Running combined contract and transaction analysis...")
+        print("   (Using programmatic tool calling with parallel execution)\n")
+
+        try:
+            # Run the combined analysis using the programmatic agent
+            result = run_combined_analysis(query, verbose=True)
+            return result
+
+        except Exception as e:
+            return (
+                f"Error during combined analysis: {e}\n\n"
+                "You can try running the contract lookup and transaction analysis "
+                "separately:\n"
+                "  - For contract info: 'What are the rates in the X contract?'\n"
+                "  - For transactions: 'Analyze the X transactions'"
+            )
+
     def handle_other_query(self, query: str) -> str:
         """Handle queries that don't fit the main categories.
 
@@ -856,7 +887,7 @@ class FinancialAgent:
             Response string to display.
         """
         return """
-I'm a financial analysis assistant that can help you with two main tasks:
+I'm a financial analysis assistant that can help you with these tasks:
 
 1. 📄 CONTRACT LOOKUP
    Ask me about financial terms in contracts. Examples:
@@ -870,6 +901,12 @@ I'm a financial analysis assistant that can help you with two main tasks:
    - "What rates are used in the codedtea file?"
    - "Show me the rate clusters for lingo ventures"
 
+3. 🔄 COMBINED ANALYSIS (NEW!)
+   Ask me to compare contractual rates with actual transaction fees. Examples:
+   - "Compare contractual fees with actual transactions for Blogwizarro"
+   - "What's the agreed rate vs actual rate for codedtea?"
+   - "Give me the contractual fee and transaction analysis for lingo ventures"
+
 Please rephrase your request to match one of these capabilities.
 """
 
@@ -881,6 +918,7 @@ Please rephrase your request to match one of these capabilities.
         print("\nI can help you with:")
         print("  • Looking up financial terms in contracts")
         print("  • Analyzing transaction data for commission rates")
+        print("  • Combined analysis: comparing contractual vs actual rates")
         print("\nType 'quit' or 'exit' to end the conversation.")
         print("=" * 60)
 
@@ -907,6 +945,8 @@ Please rephrase your request to match one of these capabilities.
                     response = await self.handle_contract_query(user_input)
                 elif category == QueryCategory.TRANSACTION_ANALYSIS:
                     response = await self.handle_transaction_query(user_input)
+                elif category == QueryCategory.COMBINED_ANALYSIS:
+                    response = await self.handle_combined_query(user_input)
                 else:
                     response = self.handle_other_query(user_input)
 

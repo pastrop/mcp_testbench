@@ -200,6 +200,37 @@ Build and verify in this order:
 
 ---
 
+## Phase 6: Combined Analysis with Programmatic Tool Calling
+
+### Overview
+Implement programmatic tool calling to handle queries that require both contract lookup AND transaction analysis in a single request.
+
+### Architecture
+Uses the **Anthropic Tool Runner** pattern (beta) to:
+1. Provide all tools to Claude in a single request
+2. Let Claude decide which tools to call (potentially in parallel)
+3. Automatically handle the agentic loop
+4. Synthesize a combined response
+
+### New Files
+- `src/agent/programmatic_agent.py` — Tool definitions and Tool Runner implementation
+- `docs/programmatic_tool_calling.md` — Design documentation
+
+### Query Classification Update
+Add a new category `COMBINED_ANALYSIS` for queries like:
+- "Give me the contractual fee for vendor X and compare with their transactions"
+- "What's the agreed rate vs actual rate for codedtea?"
+
+### Key Features
+1. **Parallel Execution**: Contract lookup and table inspection run simultaneously
+2. **Intelligent Orchestration**: Claude chooses the right algorithm based on inspection
+3. **Natural Comparison**: Claude synthesizes results into coherent analysis
+4. **Reuses Existing Code**: Wraps existing tool implementations
+
+See `docs/programmatic_tool_calling.md` for detailed design documentation.
+
+---
+
 ## Constraints & Reminders
 
 - Do not hardcode file names anywhere. All file resolution is dynamic based on user input.

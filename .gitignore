@@ -39,3 +39,6 @@ Thumbs.db
 papers/
 data/
 output/
+
+# Claude
+.claude/
