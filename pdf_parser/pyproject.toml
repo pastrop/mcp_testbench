@@ -18,8 +18,8 @@ pdf-parser = "pdf_parser.main:cli"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.0.0",
     "black>=24.0.0",
     "ruff>=0.3.0",
