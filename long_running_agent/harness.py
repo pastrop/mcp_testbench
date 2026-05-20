@@ -775,6 +775,68 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
 # CLI entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    import argparse
+
+    _MODEL_ALIASES: dict[str, str] = {
+        "haiku":  "claude-haiku-4-5-20251001",
+        "sonnet": "claude-sonnet-4-6",
+        "opus":   "claude-opus-4-7",
+    }
+
+    parser = argparse.ArgumentParser(
+        description="Portfolio Optimization Harness — Planner → Generator ↔ Evaluator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            examples:
+              uv run python long_running_agent/harness.py
+              uv run python long_running_agent/harness.py --test
+              uv run python long_running_agent/harness.py --model sonnet
+              uv run python long_running_agent/harness.py --model haiku --iterations 1
+        """),
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help=(
+            "Test mode: use claude-haiku-4-5-20251001 with 1 iteration to smoke-test "
+            "the full pipeline quickly and cheaply. Useful when Opus is overloaded or "
+            "you just want to verify the plumbing."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        metavar="MODEL",
+        help=(
+            "Override the model. Accepts short aliases (haiku, sonnet, opus) or a "
+            "full Anthropic model ID. Ignored when --test is also set."
+        ),
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        metavar="N",
+        help=(
+            "Override the number of generator ↔ evaluator rounds (default "
+            f"{MAX_ITERATIONS}). Ignored when --test is also set."
+        ),
+    )
+    args = parser.parse_args()
+
+    # Apply --test first (it takes precedence), then individual overrides.
+    if args.test:
+        MODEL = _MODEL_ALIASES["haiku"]
+        MAX_ITERATIONS = 1
+        print(f"[TEST MODE] model={MODEL}  iterations={MAX_ITERATIONS}")
+    else:
+        if args.model:
+            MODEL = _MODEL_ALIASES.get(args.model, args.model)
+            print(f"[model override] {MODEL}")
+        if args.iterations is not None:
+            if args.iterations < 1:
+                parser.error("--iterations must be ≥ 1")
+            MAX_ITERATIONS = args.iterations
+            print(f"[iterations override] {MAX_ITERATIONS}")
+
     goal = (
         "Optimise a portfolio for a US-based retail investor. "
         "Maximise annual return while ensuring the portfolio can lose "
