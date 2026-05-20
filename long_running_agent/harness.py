@@ -22,6 +22,7 @@ import os
 import sys
 import textwrap
 from dataclasses import dataclass, field, asdict
+from datetime import datetime
 from typing import Any
 
 import anthropic
@@ -251,10 +252,12 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
 
     3. DIVERSIFICATION — Are risks well-spread across uncorrelated sources?
        Penalise concentration and hidden correlations (e.g., all equity-like).
+       Penalize the agent for proposing multiple highly correlated assets.
 
     4. IMPLEMENTABILITY — Can a US retail investor actually buy these
        instruments easily and cheaply?  Penalise illiquids, high-fee
-       products, or instruments requiring institutional access.
+       products, or instruments requiring institutional access. Penalize
+       proposing strategies with a total number of tickers > 15.
 
     5. METHODOLOGY RIGOUR — Is the construction approach sound, or does it
        hand-wave?  Are the return / risk estimates grounded in data?
@@ -491,6 +494,220 @@ def run_harness(user_goal: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Human-readable Markdown report writer
+# ---------------------------------------------------------------------------
+def _format_value(v: Any) -> str:
+    """Render a JSON-ish value as a readable markdown fragment."""
+    if v is None:
+        return "_(none)_"
+    if isinstance(v, str):
+        return v.strip() or "_(empty)_"
+    if isinstance(v, (list, dict)):
+        return "```json\n" + json.dumps(v, indent=2) + "\n```"
+    return str(v)
+
+
+def _format_weight(w: Any) -> str:
+    try:
+        return f"{float(w):.2%}"
+    except (TypeError, ValueError):
+        return str(w)
+
+
+def write_markdown_report(result: dict[str, Any], path: str) -> None:
+    """
+    Write a human-readable Markdown report mirroring the JSON trace.
+    Preserves every structured field; raw model text is tucked into
+    collapsible <details> blocks so the file stays scannable.
+    """
+    spec = result.get("spec") or {}
+    final_p = result.get("final_proposal") or {}
+    final_e = result.get("final_evaluation") or {}
+    history = result.get("iteration_history") or []
+    sel = result.get("selected_iteration")
+    target = result.get("target_max_loss", TARGET_MAX_LOSS)
+
+    out: list[str] = []
+    push = out.append
+
+    # ---- Header ----
+    push("# Portfolio Optimization Harness — Report")
+    push("")
+    push(f"- **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    push(f"- **Model:** `{MODEL}`")
+    push(f"- **Iterations run:** {len(history)} of {MAX_ITERATIONS}")
+    if sel is not None:
+        push(f"- **Selected iteration:** {sel} — best passing portfolio, closest to {target:.1%} target")
+    else:
+        push("- **Selected iteration:** last (no iteration passed QA — see fallback note below)")
+    push(f"- **Target max loss:** {target:.1%}")
+    push(f"- **Pass threshold:** average score ≥ {PASS_THRESHOLD} with no single score ≤ 4")
+    push("")
+
+    # ---- Final portfolio ----
+    push("## Final Portfolio (selected)")
+    push("")
+    allocs = final_p.get("allocations") or {}
+    if allocs:
+        push("| Ticker | Weight |")
+        push("|--------|-------:|")
+        for ticker, weight in allocs.items():
+            push(f"| `{ticker}` | {_format_weight(weight)} |")
+        push("")
+    try:
+        er = float(final_p.get("expected_annual_return", 0))
+        dd = float(final_p.get("expected_max_drawdown", 0))
+        push(f"- **Expected annual return:** {er:.2%}")
+        push(f"- **Expected max drawdown:** {dd:.2%}  (target ≤ {target:.1%})")
+    except (TypeError, ValueError):
+        push(f"- **Expected annual return:** {final_p.get('expected_annual_return')}")
+        push(f"- **Expected max drawdown:** {final_p.get('expected_max_drawdown')}")
+    push(f"- **Passed QA:** {final_e.get('passed', False)}")
+    push(f"- **Average QA score:** {final_e.get('average_score', 0)}")
+    push("")
+
+    # ---- Iteration summary ----
+    push("## Iteration Summary")
+    push("")
+    push("| # | Avg Score | Exp. Return | Max Loss | Δ to target | Passed | Selected |")
+    push("|--:|----------:|------------:|---------:|------------:|:------:|:--------:|")
+    for h in history:
+        try:
+            dd_i = float(h.get("expected_max_drawdown", 0))
+            er_i = float(h.get("expected_return", 0))
+        except (TypeError, ValueError):
+            dd_i, er_i = 0.0, 0.0
+        dist = abs(dd_i - target)
+        passed = "YES" if h.get("passed") else "NO"
+        sel_mark = "★" if h.get("selected") else ""
+        push(
+            f"| {h.get('iteration')} | {h.get('average_score', 0):.2f} | "
+            f"{er_i:.2%} | {dd_i:.2%} | {dist:.2%} | {passed} | {sel_mark} |"
+        )
+    push("")
+
+    # ---- Investment spec ----
+    push("## Investment Spec (from Planner)")
+    push("")
+    for key in ("objective", "constraints", "asset_universe", "risk_budget", "evaluation_criteria"):
+        if key in spec and spec[key] not in (None, ""):
+            label = key.replace("_", " ").title()
+            push(f"### {label}")
+            push("")
+            push(_format_value(spec[key]))
+            push("")
+    if spec.get("raw_text"):
+        push("<details><summary>Planner raw response</summary>")
+        push("")
+        push("```")
+        push(spec["raw_text"].rstrip())
+        push("```")
+        push("")
+        push("</details>")
+        push("")
+
+    # ---- Selected portfolio methodology / rationale ----
+    push("## Selected Portfolio — Methodology & Rationale")
+    push("")
+    if final_p.get("methodology"):
+        push("### Methodology")
+        push("")
+        push(_format_value(final_p["methodology"]))
+        push("")
+    if final_p.get("rationale"):
+        push("### Rationale")
+        push("")
+        push(_format_value(final_p["rationale"]))
+        push("")
+    if final_p.get("raw_text"):
+        push("<details><summary>Generator raw response</summary>")
+        push("")
+        push("```")
+        push(final_p["raw_text"].rstrip())
+        push("```")
+        push("")
+        push("</details>")
+        push("")
+
+    # ---- Selected portfolio evaluation ----
+    push("## Selected Portfolio — Evaluator Report")
+    push("")
+    scores = final_e.get("scores") or {}
+    if scores:
+        push("### Scores")
+        push("")
+        push("| Criterion | Score |")
+        push("|-----------|------:|")
+        for k, v in scores.items():
+            push(f"| {k.replace('_', ' ')} | {v} |")
+        push(f"| **Average** | **{final_e.get('average_score', 0)}** |")
+        push("")
+    if final_e.get("critique"):
+        push("### Critique")
+        push("")
+        push(_format_value(final_e["critique"]))
+        push("")
+    if final_e.get("raw_text"):
+        push("<details><summary>Evaluator raw response</summary>")
+        push("")
+        push("```")
+        push(final_e["raw_text"].rstrip())
+        push("```")
+        push("")
+        push("</details>")
+        push("")
+
+    # ---- Per-iteration detail ----
+    push("## Iteration History (detailed)")
+    push("")
+    for h in history:
+        sel_mark = " — ★ selected" if h.get("selected") else ""
+        push(f"### Iteration {h.get('iteration')}{sel_mark}")
+        push("")
+        try:
+            dd_i = float(h.get("expected_max_drawdown", 0))
+            er_i = float(h.get("expected_return", 0))
+            push(f"- **Passed:** {h.get('passed')}")
+            push(f"- **Average score:** {h.get('average_score', 0):.2f}")
+            push(f"- **Expected return:** {er_i:.2%}")
+            push(f"- **Expected max drawdown:** {dd_i:.2%}")
+        except (TypeError, ValueError):
+            push(f"- **Passed:** {h.get('passed')}")
+            push(f"- **Average score:** {h.get('average_score')}")
+            push(f"- **Expected return:** {h.get('expected_return')}")
+            push(f"- **Expected max drawdown:** {h.get('expected_max_drawdown')}")
+        push("")
+        scores_i = h.get("scores") or {}
+        if scores_i:
+            push("**Scores:**")
+            push("")
+            push("| Criterion | Score |")
+            push("|-----------|------:|")
+            for k, v in scores_i.items():
+                push(f"| {k.replace('_', ' ')} | {v} |")
+            push("")
+        allocs_i = h.get("allocations") or {}
+        if allocs_i:
+            push("**Allocations:**")
+            push("")
+            push("| Ticker | Weight |")
+            push("|--------|-------:|")
+            for ticker, weight in allocs_i.items():
+                push(f"| `{ticker}` | {_format_weight(weight)} |")
+            push("")
+        snip = h.get("critique_snippet")
+        if snip:
+            push("**Critique snippet (first 300 chars):**")
+            push("")
+            for line in snip.splitlines():
+                push(f"> {line}")
+            push("")
+
+    with open(path, "w") as f:
+        f.write("\n".join(out))
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -507,6 +724,9 @@ if __name__ == "__main__":
     # Dump full trace to a JSON file for inspection
     with open("harness_output.json", "w") as f:
         json.dump(result, f, indent=2, default=str)
+
+    # Also write a human-readable Markdown report
+    write_markdown_report(result, "harness_output.md")
 
     print("\n" + "=" * 60)
     print("FINAL PORTFOLIO")
@@ -537,4 +757,6 @@ if __name__ == "__main__":
             f"{passed_str}"
         )
 
-    print(f"\nFull trace saved to harness_output.json")
+    print("\nFull trace saved to:")
+    print("  - harness_output.json   (machine-readable)")
+    print("  - harness_output.md     (human-readable)")
