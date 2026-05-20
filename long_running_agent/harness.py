@@ -87,6 +87,7 @@ class InvestmentSpec:
 class PortfolioProposal:
     """Produced by the Generator.  Consumed by the Evaluator."""
     allocations: dict[str, float] = field(default_factory=dict)
+    descriptions: dict[str, str] = field(default_factory=dict)
     expected_annual_return: float = 0.0
     expected_max_drawdown: float = 0.0
     methodology: str = ""
@@ -242,12 +243,19 @@ GENERATOR_SYSTEM = textwrap.dedent("""\
     Respond ONLY with a JSON object:
     {
       "allocations": {"TICKER_OR_ASSET": weight, ...},
+      "descriptions": {"TICKER_OR_ASSET": "one-line plain-English description", ...},
       "expected_annual_return": float,
       "expected_max_drawdown": float,
       "methodology": "string",
       "rationale": "string"
     }
 
+    The "descriptions" map must contain one entry for EVERY ticker in
+    "allocations".  Each description should be a single concise sentence
+    (≤ 15 words) that tells a non-expert what the instrument is, e.g.:
+      "VOO": "Vanguard S&P 500 ETF — tracks the 500 largest US companies",
+      "TLT": "iShares 20+ Year Treasury ETF — long-duration US government bonds",
+      "SPX_PUT_SPREAD": "Protective put spread on the S&P 500 index — tail-risk hedge"
     Weights must sum to 1.0.  No markdown fences — raw JSON only.
 """)
 
@@ -278,6 +286,7 @@ def run_generator(
 
     return PortfolioProposal(
         allocations=data.get("allocations", {}),
+        descriptions=data.get("descriptions", {}),
         expected_annual_return=data.get("expected_annual_return", 0),
         expected_max_drawdown=data.get("expected_max_drawdown", 0),
         methodology=data.get("methodology", ""),
@@ -491,6 +500,7 @@ def run_harness(user_goal: str) -> dict[str, Any]:
         history.append({
             "iteration": i,
             "allocations": proposal.allocations,
+            "descriptions": proposal.descriptions,
             "expected_return": proposal.expected_annual_return,
             "expected_max_drawdown": proposal.expected_max_drawdown,
             "scores": evaluation.scores,
@@ -612,11 +622,19 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
     push("## Final Portfolio (selected)")
     push("")
     allocs = final_p.get("allocations") or {}
+    descs = final_p.get("descriptions") or {}
     if allocs:
-        push("| Ticker | Weight |")
-        push("|--------|-------:|")
-        for ticker, weight in allocs.items():
-            push(f"| `{ticker}` | {_format_weight(weight)} |")
+        if descs:
+            push("| Ticker | Weight | Description |")
+            push("|--------|-------:|-------------|")
+            for ticker, weight in allocs.items():
+                desc = descs.get(ticker, "")
+                push(f"| `{ticker}` | {_format_weight(weight)} | {desc} |")
+        else:
+            push("| Ticker | Weight |")
+            push("|--------|-------:|")
+            for ticker, weight in allocs.items():
+                push(f"| `{ticker}` | {_format_weight(weight)} |")
         push("")
     try:
         er = float(final_p.get("expected_annual_return", 0))
@@ -751,13 +769,21 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
                 push(f"| {k.replace('_', ' ')} | {v} |")
             push("")
         allocs_i = h.get("allocations") or {}
+        descs_i = h.get("descriptions") or {}
         if allocs_i:
             push("**Allocations:**")
             push("")
-            push("| Ticker | Weight |")
-            push("|--------|-------:|")
-            for ticker, weight in allocs_i.items():
-                push(f"| `{ticker}` | {_format_weight(weight)} |")
+            if descs_i:
+                push("| Ticker | Weight | Description |")
+                push("|--------|-------:|-------------|")
+                for ticker, weight in allocs_i.items():
+                    desc = descs_i.get(ticker, "")
+                    push(f"| `{ticker}` | {_format_weight(weight)} | {desc} |")
+            else:
+                push("| Ticker | Weight |")
+                push("|--------|-------:|")
+                for ticker, weight in allocs_i.items():
+                    push(f"| `{ticker}` | {_format_weight(weight)} |")
             push("")
         snip = h.get("critique_snippet")
         if snip:
