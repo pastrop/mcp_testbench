@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sys
 import textwrap
+import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Any
@@ -37,13 +39,34 @@ PASS_THRESHOLD = 7          # minimum average score (out of 10) to pass QA
 TARGET_MAX_LOSS = 0.05      # 5% — the loss budget we want expected_max_drawdown to land on
 UNDER_UTILISATION_BAND = 0.04  # below this we consider the risk budget under-utilised
 
+# --- Retry / backoff config for transient Anthropic API errors -------------
+# Sequence of attempts and sleeps when an attempt fails with a retryable
+# error (529 Overloaded, 429 rate limit, 5xx, connection / timeout errors):
+#
+#   attempt 1  →  sleep   2s (±25% jitter) →
+#   attempt 2  →  sleep   4s  →
+#   attempt 3  →  sleep   8s  →
+#   attempt 4  →  sleep  16s  →
+#   attempt 5  →  sleep  32s  →
+#   attempt 6  →  give up and re-raise
+#
+# Max wall-clock spent on retries before giving up ≈ 62s (+ jitter).
+SDK_MAX_RETRIES = 5                              # SDK-level retries (fast transient blips)
+RETRY_MAX_ATTEMPTS = 6                           # outer wrapper attempts on top of SDK
+RETRY_INITIAL_BACKOFF_SECONDS = 2.0
+RETRY_MAX_BACKOFF_SECONDS = 32.0
+RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504, 529}
+
 if not os.environ.get("ANTHROPIC_API_KEY"):
     sys.exit(
         "ERROR: ANTHROPIC_API_KEY environment variable is not set. "
         "Export it (e.g. `export ANTHROPIC_API_KEY=sk-ant-...`) and try again."
     )
 
-client = anthropic.Anthropic()   # picks up ANTHROPIC_API_KEY from env (validated above)
+# Bump SDK retries above the default of 2.  The SDK handles fast transient
+# blips silently; our outer wrapper (in call_claude) handles longer overload
+# events with visible progress logs.
+client = anthropic.Anthropic(max_retries=SDK_MAX_RETRIES)
 
 
 # ---------------------------------------------------------------------------
@@ -84,15 +107,56 @@ class EvaluationResult:
 # ---------------------------------------------------------------------------
 # Helper: call the Anthropic API
 # ---------------------------------------------------------------------------
+def _is_retryable(exc: BaseException) -> bool:
+    """
+    Return True for transient Anthropic API errors worth retrying:
+      • 429 Rate-limit, 5xx, 529 Overloaded — server-side back-pressure.
+      • Connection / timeout errors — network blips.
+    Auth, validation, and other 4xx errors are NOT retried.
+    """
+    if isinstance(exc, (anthropic.APIConnectionError, anthropic.APITimeoutError)):
+        return True
+    if isinstance(exc, anthropic.APIStatusError):
+        return getattr(exc, "status_code", None) in RETRYABLE_HTTP_STATUS
+    return False
+
+
 def call_claude(system: str, user: str) -> str:
-    """Simple wrapper around the Messages API."""
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    return resp.content[0].text
+    """
+    Wrapper around the Messages API with exponential-backoff retry on
+    transient errors (529 Overloaded, 429 rate limits, 5xx, connection
+    blips).  Re-raises immediately on terminal errors (auth, bad request,
+    etc.) so we fail fast on real bugs.
+    """
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+        try:
+            resp = client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            return resp.content[0].text
+        except Exception as exc:
+            if attempt == RETRY_MAX_ATTEMPTS or not _is_retryable(exc):
+                raise
+            backoff = min(
+                RETRY_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+                RETRY_MAX_BACKOFF_SECONDS,
+            )
+            backoff *= 1 + random.random() * 0.25  # +0–25% jitter
+            kind = type(exc).__name__
+            status = getattr(exc, "status_code", None)
+            status_suffix = f" (HTTP {status})" if status else ""
+            print(
+                f"  ⚠️  Anthropic API {kind}{status_suffix} on attempt "
+                f"{attempt}/{RETRY_MAX_ATTEMPTS} — retrying in {backoff:.1f}s",
+                flush=True,
+            )
+            time.sleep(backoff)
+    # The loop only exits via return or raise — this is unreachable but
+    # satisfies static analysers.
+    raise RuntimeError("call_claude retry loop exited unexpectedly")
 
 
 # ---------------------------------------------------------------------------
