@@ -33,6 +33,8 @@ MODEL = "claude-opus-4-7"
 MAX_TOKENS = 4096
 MAX_ITERATIONS = 3          # generator ↔ evaluator rounds
 PASS_THRESHOLD = 7          # minimum average score (out of 10) to pass QA
+TARGET_MAX_LOSS = 0.05      # 5% — the loss budget we want expected_max_drawdown to land on
+UNDER_UTILISATION_BAND = 0.04  # below this we consider the risk budget under-utilised
 
 if not os.environ.get("ANTHROPIC_API_KEY"):
     sys.exit(
@@ -161,6 +163,17 @@ GENERATOR_SYSTEM = textwrap.dedent("""\
        spec BEFORE submitting.
     4. If you received evaluator feedback, address every point raised.
 
+    RISK BUDGET DISCIPLINE — IMPORTANT:
+    Treat the 5% max annual loss as a budget to be USED, not avoided.
+    A portfolio with a 2% expected_max_drawdown is wasting risk capacity
+    and almost certainly leaving return on the table.  Aim your
+    expected_max_drawdown as close to 5% as you honestly can WITHOUT
+    crossing it.  If prior feedback indicated you were over 5%, your top
+    priority this round is bringing the drawdown down — even at some cost
+    to expected return.  If prior feedback indicated you were well under
+    5%, raise the return profile by deploying more risk-bearing exposure
+    until your drawdown is near (but under) 5%.
+
     Respond ONLY with a JSON object:
     {
       "allocations": {"TICKER_OR_ASSET": weight, ...},
@@ -224,6 +237,13 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
        ≤5% max annual loss constraint under realistic historical scenarios?
        Check: 2008 GFC, 2020 COVID crash, 2022 rate-hike drawdown.
        Score ≤ 4 if ANY scenario likely breaches the 5% loss limit.
+       ALSO score ≤ 6 if the expected_max_drawdown is materially BELOW 5%
+       (e.g., under ~4%) without a specific constraint forcing that level
+       of conservatism — under-utilising the 5% risk budget is a flaw,
+       not a virtue, because it sacrifices return for no good reason.
+       A portfolio that lands near (but under) 5% should score highest
+       on this criterion; one that lands far below it should be marked
+       down for wasting risk capacity.
 
     2. RETURN POTENTIAL — Is the expected return realistic and competitive
        given the constraints?  Penalise both overestimation and unnecessary
@@ -296,18 +316,100 @@ def run_evaluator(
 # ---------------------------------------------------------------------------
 # ORCHESTRATOR — the harness loop
 # ---------------------------------------------------------------------------
+def _build_feedback(evaluation: EvaluationResult, proposal: PortfolioProposal) -> str:
+    """
+    Produce the next round's feedback string based on the current evaluation.
+
+    Three regimes:
+      • Failed QA          → pass the critique through unchanged (today's behaviour).
+      • Passed but over 5% → tell the generator to bring drawdown down to ~5%
+                              without sacrificing scores.
+      • Passed but well
+        under 5%           → tell the generator the risk budget is being wasted
+                              and to push drawdown closer to (but under) 5%.
+      • Passed and near 5% → still ask for a refinement attempt — the selector
+                              will keep the best across iterations.
+    """
+    if not evaluation.passed:
+        return evaluation.critique
+
+    dd = proposal.expected_max_drawdown
+    if dd > TARGET_MAX_LOSS:
+        overshoot_pct = (dd - TARGET_MAX_LOSS) * 100
+        return (
+            f"QA PASSED with average score {evaluation.average_score}, "
+            f"BUT expected_max_drawdown is {dd:.2%}, which exceeds the "
+            f"{TARGET_MAX_LOSS:.0%} loss target by {overshoot_pct:.1f} "
+            f"percentage points. Your top priority this round is to "
+            f"REDUCE expected_max_drawdown as close to {TARGET_MAX_LOSS:.0%} "
+            f"as possible WITHOUT crossing it, while keeping every QA "
+            f"score ≥ {PASS_THRESHOLD}. Accept lower expected return if "
+            f"necessary. Prior critique for reference:\n{evaluation.critique}"
+        )
+    if dd < UNDER_UTILISATION_BAND:
+        return (
+            f"QA PASSED with average score {evaluation.average_score} and "
+            f"expected_max_drawdown of {dd:.2%}, which is well UNDER the "
+            f"{TARGET_MAX_LOSS:.0%} loss budget. You are leaving return on "
+            f"the table. This round, deploy more risk-bearing exposure to "
+            f"raise expected_max_drawdown closer to (but still under) "
+            f"{TARGET_MAX_LOSS:.0%}, while keeping every QA score "
+            f"≥ {PASS_THRESHOLD}. Prior critique for reference:\n"
+            f"{evaluation.critique}"
+        )
+    return (
+        f"QA PASSED with average score {evaluation.average_score} and "
+        f"expected_max_drawdown of {dd:.2%}, which is close to the "
+        f"{TARGET_MAX_LOSS:.0%} target. Attempt one more refinement: try "
+        f"to either raise expected_annual_return without exceeding "
+        f"{TARGET_MAX_LOSS:.0%} drawdown, or improve the QA scores while "
+        f"holding drawdown near {TARGET_MAX_LOSS:.0%}. Prior critique:\n"
+        f"{evaluation.critique}"
+    )
+
+
+def _select_best_iteration(history: list[dict]) -> int | None:
+    """
+    Return the 1-based iteration index of the best passing iteration, or None
+    if no iteration passed.
+
+    Selection key (smaller is better):
+      1. |expected_max_drawdown - TARGET_MAX_LOSS|   — closeness to the 5% target
+      2. expected_max_drawdown                       — prefer smaller drawdown on tie
+      3. -average_score                              — prefer higher score on tie
+    """
+    passing = [h for h in history if h["passed"]]
+    if not passing:
+        return None
+    best = min(
+        passing,
+        key=lambda h: (
+            abs(h["expected_max_drawdown"] - TARGET_MAX_LOSS),
+            h["expected_max_drawdown"],
+            -h["average_score"],
+        ),
+    )
+    return best["iteration"]
+
+
 def run_harness(user_goal: str) -> dict[str, Any]:
     """
     Main entry point.  Runs the full Planner → Generator ↔ Evaluator loop.
-    Returns a summary dict with the final portfolio and all iteration history.
+
+    Unlike the original harness, this version ALWAYS runs MAX_ITERATIONS
+    rounds, even if QA passes earlier.  After the loop completes, it
+    selects the passing iteration whose expected_max_drawdown is closest
+    to TARGET_MAX_LOSS.  If no iteration passes, the last iteration is
+    returned (matching the original "max iterations without passing"
+    behaviour).
     """
     # --- Step 1: Plan ---
     spec = run_planner(user_goal)
 
     history: list[dict] = []
-    proposal = None
-    evaluation = None
-    feedback = None
+    proposals: list[PortfolioProposal] = []
+    evaluations: list[EvaluationResult] = []
+    feedback: str | None = None
 
     for i in range(1, MAX_ITERATIONS + 1):
         # --- Step 2: Generate ---
@@ -315,6 +417,9 @@ def run_harness(user_goal: str) -> dict[str, Any]:
 
         # --- Step 3: Evaluate ---
         evaluation = run_evaluator(spec, proposal)
+
+        proposals.append(proposal)
+        evaluations.append(evaluation)
 
         history.append({
             "iteration": i,
@@ -325,27 +430,62 @@ def run_harness(user_goal: str) -> dict[str, Any]:
             "average_score": evaluation.average_score,
             "passed": evaluation.passed,
             "critique_snippet": evaluation.critique[:300],
+            "selected": False,
         })
 
         print(f"\n--- Iteration {i} result ---")
-        print(f"  Scores : {evaluation.scores}")
-        print(f"  Average: {evaluation.average_score}")
-        print(f"  Passed : {evaluation.passed}")
+        print(f"  Scores              : {evaluation.scores}")
+        print(f"  Average             : {evaluation.average_score}")
+        print(f"  Passed              : {evaluation.passed}")
+        print(f"  Expected max loss   : {proposal.expected_max_drawdown:.2%}")
+        print(f"  Target max loss     : {TARGET_MAX_LOSS:.0%}")
+
+        if i == MAX_ITERATIONS:
+            # No need to compute feedback after the last round.
+            continue
 
         if evaluation.passed:
-            print("\n✅  Portfolio PASSED evaluation — stopping.\n")
-            break
+            dd = proposal.expected_max_drawdown
+            if dd > TARGET_MAX_LOSS:
+                print("✅  Passed QA but drawdown OVER target — pushing for lower drawdown next round.\n")
+            elif dd < UNDER_UTILISATION_BAND:
+                print("✅  Passed QA but drawdown WELL UNDER target — pushing for more risk budget use next round.\n")
+            else:
+                print("✅  Passed QA and drawdown near target — attempting one more refinement.\n")
+        else:
+            print("❌  Failed QA — feeding critique back to generator.\n")
 
-        print("❌  Portfolio FAILED — feeding critique back to generator …\n")
-        feedback = evaluation.critique
+        feedback = _build_feedback(evaluation, proposal)
 
+    # --- Step 4: Select the best passing iteration ---
+    selected_idx = _select_best_iteration(history)
+
+    if selected_idx is not None:
+        history[selected_idx - 1]["selected"] = True
+        final_proposal = proposals[selected_idx - 1]
+        final_evaluation = evaluations[selected_idx - 1]
+        print(
+            f"\n🎯  Selected iteration {selected_idx} of {MAX_ITERATIONS}: "
+            f"passing portfolio with expected_max_drawdown "
+            f"{final_proposal.expected_max_drawdown:.2%} "
+            f"(closest to {TARGET_MAX_LOSS:.0%} target).\n"
+        )
     else:
-        print(f"\n⚠️  Reached max iterations ({MAX_ITERATIONS}) without passing.\n")
+        # Fall back to the last iteration when nothing passed.
+        history[-1]["selected"] = True
+        final_proposal = proposals[-1]
+        final_evaluation = evaluations[-1]
+        print(
+            f"\n⚠️  Reached max iterations ({MAX_ITERATIONS}) without any "
+            f"passing portfolio. Returning last iteration.\n"
+        )
 
     return {
         "spec": asdict(spec),
-        "final_proposal": asdict(proposal) if proposal else None,
-        "final_evaluation": asdict(evaluation) if evaluation else None,
+        "final_proposal": asdict(final_proposal),
+        "final_evaluation": asdict(final_evaluation),
+        "selected_iteration": selected_idx,
+        "target_max_loss": TARGET_MAX_LOSS,
         "iteration_history": history,
     }
 
@@ -371,11 +511,30 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("FINAL PORTFOLIO")
     print("=" * 60)
+    sel = result.get("selected_iteration")
+    if sel is not None:
+        print(f"  Selected iteration : {sel} of {MAX_ITERATIONS} (best passing)")
+    else:
+        print(f"  Selected iteration : last of {MAX_ITERATIONS} (no iteration passed)")
+    print(f"  Target max loss    : {result['target_max_loss']:.1%}\n")
+
     if result["final_proposal"]:
         for ticker, weight in result["final_proposal"]["allocations"].items():
             print(f"  {ticker:20s}  {weight:6.1%}")
-        print(f"\n  Expected return   : {result['final_proposal']['expected_annual_return']:.1%}")
-        print(f"  Expected max loss : {result['final_proposal']['expected_max_drawdown']:.1%}")
-    print(f"\n  Passed QA         : {result['final_evaluation']['passed']}")
-    print(f"  Final avg score   : {result['final_evaluation']['average_score']}")
+        print(f"\n  Expected return    : {result['final_proposal']['expected_annual_return']:.1%}")
+        print(f"  Expected max loss  : {result['final_proposal']['expected_max_drawdown']:.1%}")
+    print(f"\n  Passed QA          : {result['final_evaluation']['passed']}")
+    print(f"  Final avg score    : {result['final_evaluation']['average_score']}")
+
+    print("\n  Iteration summary:")
+    for h in result["iteration_history"]:
+        mark = "★" if h["selected"] else " "
+        passed_str = "PASS" if h["passed"] else "FAIL"
+        print(
+            f"   {mark} #{h['iteration']}  "
+            f"avg={h['average_score']:.2f}  "
+            f"max_loss={h['expected_max_drawdown']:.2%}  "
+            f"{passed_str}"
+        )
+
     print(f"\nFull trace saved to harness_output.json")
