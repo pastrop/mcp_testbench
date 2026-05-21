@@ -39,6 +39,16 @@ PASS_THRESHOLD = 7          # minimum average score (out of 10) to pass QA
 TARGET_MAX_LOSS = 0.05      # 5% — the loss budget we want expected_max_drawdown to land on
 UNDER_UTILISATION_BAND = 0.04  # below this we consider the risk budget under-utilised
 
+# --- Pricing / lot-size feasibility ----------------------------------------
+DEFAULT_CAPITAL = 100_000.0  # USD assumed for whole-share lot-size check
+PRICING_DISCLAIMER = (
+    "Prices are fetched from Yahoo Finance via the `yfinance` library and "
+    "reflect the most recent available quote (last close or recent "
+    "intraday). They may differ from real-time market data, and Yahoo's "
+    "unofficial API can occasionally return stale or missing values. "
+    "Do NOT rely on these numbers for trading decisions."
+)
+
 # --- Retry / backoff config for transient Anthropic API errors -------------
 # Sequence of attempts and sleeps when an attempt fails with a retryable
 # error (529 Overloaded, 429 rate limit, 5xx, connection / timeout errors):
@@ -120,6 +130,36 @@ class AdvisorOutput:
     correlation_pairs: list[dict[str, Any]] = field(default_factory=list)
     notes: str = ""
     raw_text: str = ""
+
+
+@dataclass
+class TickerPricing:
+    """One row of the pricing / lot-size feasibility table."""
+    ticker: str
+    weight: float                       # target weight from the final proposal
+    status: str = "ok"                  # "ok" | "error"
+    price: float | None = None          # last available quote in USD
+    target_dollars: float = 0.0         # capital * weight
+    shares: int = 0                     # floor(target_dollars / price)
+    actual_dollars: float = 0.0         # shares * price
+    actual_weight: float = 0.0          # actual_dollars / capital
+    weight_drift: float = 0.0           # actual_weight - target weight (signed)
+    error: str | None = None
+
+
+@dataclass
+class PricingResult:
+    """Aggregated pricing + lot-size feasibility report."""
+    capital: float = 0.0
+    total_invested: float = 0.0
+    leftover_cash: float = 0.0
+    max_abs_drift: float = 0.0          # largest |weight_drift| across OK rows
+    rows: list[TickerPricing] = field(default_factory=list)
+    failed_tickers: list[str] = field(default_factory=list)
+    disclaimer: str = ""
+    source: str = "yfinance"
+    fetched_at: str = ""                # ISO timestamp of the fetch
+    error: str | None = None            # set when pricing as a whole could not run
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +713,162 @@ def run_advisor(final_proposal: PortfolioProposal) -> AdvisorOutput:
 
 
 # ---------------------------------------------------------------------------
+# STEP — PRICING & LOT-SIZE FEASIBILITY (yfinance, no LLM call)
+# ---------------------------------------------------------------------------
+def _fetch_one_price(ticker: str) -> tuple[float | None, str | None]:
+    """
+    Fetch the latest available price for one ticker via yfinance.
+    Returns (price, error_message).  On success: (float, None).
+    On any failure (unknown ticker, network blip, NaN result):
+    (None, "human-readable reason").  Never raises.
+    """
+    try:
+        import yfinance as yf
+    except ImportError as exc:
+        return None, f"yfinance not installed ({exc})"
+    try:
+        t = yf.Ticker(ticker)
+        price: float | None = None
+        # fast_info is the cheap path; supports dict and attribute access
+        # across yfinance versions.
+        try:
+            fi = t.fast_info
+            try:
+                price = fi["last_price"]
+            except (KeyError, TypeError):
+                price = getattr(fi, "last_price", None)
+        except Exception:
+            price = None
+        # NaN guard (yfinance sometimes returns NaN for unknown tickers).
+        if price is not None and isinstance(price, float) and price != price:
+            price = None
+        # Fall back to a 1-day history pull if fast_info gave us nothing.
+        if price is None:
+            try:
+                hist = t.history(period="1d")
+                if not hist.empty:
+                    price = float(hist["Close"].iloc[-1])
+            except Exception:
+                price = None
+        if price is None or price <= 0:
+            return None, "no price returned (ticker may be unrecognised)"
+        return float(price), None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def run_pricing(
+    final_proposal: PortfolioProposal,
+    capital: float,
+) -> PricingResult:
+    """
+    Fetch the latest price for each ticker in the final portfolio and
+    compute a whole-share lot-size feasibility check:
+
+        target_$  = capital * weight
+        shares    = floor(target_$ / price)
+        actual_$  = shares * price
+        actual_w  = actual_$ / capital
+        drift     = actual_w - weight
+
+    Failures are per-ticker and never crash the pipeline.  Model-invented
+    pseudo-tickers (e.g. "SPX_PUT_SPREAD") are recorded as failed rows
+    with their target_$ preserved for context.
+    """
+    print("\n" + "=" * 60)
+    print(
+        f"PRICING — fetching latest prices from yfinance "
+        f"(capital=${capital:,.0f}) …"
+    )
+    print("=" * 60)
+
+    # Up-front import check — if yfinance is missing, return a marker
+    # result so the report can render a helpful note instead of a stack trace.
+    try:
+        import yfinance as _yf  # noqa: F401
+        import logging
+        # yfinance is chatty about failed tickers — quiet it down so the
+        # harness log stays readable.  We surface per-ticker errors ourselves.
+        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+    except ImportError as exc:
+        msg = (
+            f"yfinance is not installed ({exc}). Run `uv sync` from the "
+            f"testbench root to install it."
+        )
+        print(f"  ⚠️  {msg}")
+        return PricingResult(
+            capital=capital,
+            disclaimer=PRICING_DISCLAIMER,
+            error=msg,
+            fetched_at=datetime.now().isoformat(timespec="seconds"),
+        )
+
+    rows: list[TickerPricing] = []
+    failed: list[str] = []
+
+    for ticker, weight in final_proposal.allocations.items():
+        w = float(weight)
+        target_dollars = capital * w
+        price, err = _fetch_one_price(ticker)
+        if price is None:
+            print(f"  ✗ {ticker:25s}  {err}")
+            rows.append(TickerPricing(
+                ticker=ticker,
+                weight=w,
+                status="error",
+                target_dollars=round(target_dollars, 2),
+                error=err,
+            ))
+            failed.append(ticker)
+            continue
+        shares = int(target_dollars // price)
+        actual_dollars = shares * price
+        print(
+            f"  ✓ {ticker:25s}  ${price:>10,.2f}   "
+            f"{shares:>6d} sh   ${actual_dollars:>12,.2f}"
+        )
+        rows.append(TickerPricing(
+            ticker=ticker,
+            weight=w,
+            status="ok",
+            price=round(price, 4),
+            target_dollars=round(target_dollars, 2),
+            shares=shares,
+            actual_dollars=round(actual_dollars, 2),
+        ))
+
+    total_invested = sum(r.actual_dollars for r in rows)
+    leftover_cash = capital - total_invested
+    # Fill in actual_weight / weight_drift now that the totals are known.
+    for r in rows:
+        if r.status == "ok" and capital > 0:
+            r.actual_weight = round(r.actual_dollars / capital, 6)
+            r.weight_drift = round(r.actual_weight - r.weight, 6)
+    max_abs_drift = max(
+        (abs(r.weight_drift) for r in rows if r.status == "ok"),
+        default=0.0,
+    )
+
+    print(f"\n  Total invested  : ${total_invested:>12,.2f}")
+    print(f"  Leftover cash   : ${leftover_cash:>12,.2f}")
+    print(f"  Max |Δ weight|  : {max_abs_drift:.2%}")
+    if failed:
+        print(f"  Failed tickers  : {', '.join(failed)}")
+
+    return PricingResult(
+        capital=capital,
+        total_invested=round(total_invested, 2),
+        leftover_cash=round(leftover_cash, 2),
+        max_abs_drift=round(max_abs_drift, 6),
+        rows=rows,
+        failed_tickers=failed,
+        disclaimer=PRICING_DISCLAIMER,
+        source="yfinance",
+        fetched_at=datetime.now().isoformat(timespec="seconds"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # ORCHESTRATOR — the harness loop
 # ---------------------------------------------------------------------------
 def _build_feedback(evaluation: EvaluationResult, proposal: PortfolioProposal) -> str:
@@ -756,10 +952,13 @@ def run_harness(
     *,
     refine: bool = True,
     advise: bool = True,
+    price: bool = True,
+    capital: float = DEFAULT_CAPITAL,
 ) -> dict[str, Any]:
     """
     Main entry point.  Runs the full Planner → Generator ↔ Evaluator loop,
-    then (by default) a post-selection REFINER pass and an ADVISOR pass.
+    then (by default) a post-selection REFINER pass, an ADVISOR pass, and
+    a PRICING / lot-size feasibility pass.
 
     Flow:
       1. Planner expands the goal into a full investment spec.
@@ -778,6 +977,11 @@ def run_harness(
          portfolio.  It returns a pairwise correlation snapshot and a
          list of structured "merge X+Y into Z" suggestions with explicit
          trade-offs, so the human reader can decide whether to apply any.
+      6. If `price=True`, fetch the latest price for each ticker in the
+         final portfolio via yfinance and compute a whole-share lot-size
+         feasibility check against `capital` USD.  Per-ticker failures
+         (unknown ticker, network blip, model-invented pseudo-ticker) are
+         recorded gracefully and never abort the pipeline.
     """
     # --- Step 1: Plan ---
     spec = run_planner(user_goal)
@@ -957,6 +1161,35 @@ def run_harness(
             f"NOT modified — see the report for details.\n"
         )
 
+    # --- Step 7: Pricing & lot-size feasibility (yfinance) ---
+    pricing_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "capital": capital,
+        "total_invested": 0.0,
+        "leftover_cash": 0.0,
+        "max_abs_drift": 0.0,
+        "rows": [],
+        "failed_tickers": [],
+        "disclaimer": PRICING_DISCLAIMER,
+        "source": "yfinance",
+        "fetched_at": "",
+        "error": None,
+    }
+    if not price:
+        pricing_block["skipped_reason"] = "disabled via --no-prices / --test"
+        print("\n(Pricing step skipped.)\n")
+    elif not final_proposal.allocations:
+        pricing_block["skipped_reason"] = "no allocations to price"
+        print("\n(Pricing step skipped — no allocations.)\n")
+    else:
+        pricing_result = run_pricing(final_proposal, capital)
+        pricing_block = {
+            "performed": True,
+            "skipped_reason": None,
+            **asdict(pricing_result),
+        }
+
     return {
         "spec": asdict(spec),
         "final_proposal": asdict(final_proposal),
@@ -968,6 +1201,7 @@ def run_harness(
         "iteration_history": history,
         "refinement": refinement_block,
         "advisor": advisor_block,
+        "pricing": pricing_block,
     }
 
 
@@ -1037,6 +1271,17 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
         )
     elif advisor_hdr.get("skipped_reason"):
         push(f"- **Advisor:** skipped ({advisor_hdr['skipped_reason']})")
+    pricing_hdr = result.get("pricing") or {}
+    if pricing_hdr.get("performed"):
+        n_failed = len(pricing_hdr.get("failed_tickers") or [])
+        cap_h = pricing_hdr.get("capital", 0.0) or 0.0
+        suffix = f", {n_failed} ticker(s) unpriced" if n_failed else ""
+        push(
+            f"- **Pricing:** performed — yfinance quotes for "
+            f"${cap_h:,.0f} capital lot-size check{suffix}"
+        )
+    elif pricing_hdr.get("skipped_reason"):
+        push(f"- **Pricing:** skipped ({pricing_hdr['skipped_reason']})")
     push(f"- **Target max loss:** {target:.1%}")
     push(f"- **Pass threshold:** average score ≥ {PASS_THRESHOLD} with no single score ≤ 4 AND evaluator says passed")
     push("")
@@ -1394,6 +1639,75 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
         push(f"_Advisor pass skipped — {advisor['skipped_reason']}._")
         push("")
 
+    # ---- Pricing & lot-size feasibility ----
+    pricing = result.get("pricing") or {}
+    if pricing.get("performed"):
+        push("## Latest Prices & Lot-Size Feasibility")
+        push("")
+        if pricing.get("disclaimer"):
+            push(f"> ⚠️ **Data source disclaimer.** {pricing['disclaimer']}")
+            push("")
+
+        cap = float(pricing.get("capital", 0) or 0)
+        total_inv = float(pricing.get("total_invested", 0) or 0)
+        leftover = float(pricing.get("leftover_cash", 0) or 0)
+        max_drift = float(pricing.get("max_abs_drift", 0) or 0)
+        fetched = pricing.get("fetched_at", "")
+        failed_tickers = pricing.get("failed_tickers") or []
+
+        push(f"- **Assumed capital:** ${cap:,.2f}")
+        push(f"- **Total invested (whole shares):** ${total_inv:,.2f}")
+        push(f"- **Leftover cash:** ${leftover:,.2f}")
+        push(f"- **Max |weight drift|:** {max_drift:.2%}")
+        if fetched:
+            push(f"- **Fetched at:** {fetched}")
+        if failed_tickers:
+            ft = ", ".join(f"`{t}`" for t in failed_tickers)
+            push(f"- **Unpriced tickers:** {ft}")
+        push("")
+
+        rows_p = pricing.get("rows") or []
+        if rows_p:
+            push("| Ticker | Price | Target W. | Target $ | Shares | "
+                 "Actual $ | Actual W. | Δ Weight | Status |")
+            push("|--------|------:|----------:|---------:|------:|"
+                 "---------:|----------:|---------:|--------|")
+            for r in rows_p:
+                ticker = r.get("ticker", "")
+                status = r.get("status", "ok")
+                weight = float(r.get("weight", 0) or 0)
+                target_d = float(r.get("target_dollars", 0) or 0)
+                if status == "ok":
+                    price_v = float(r.get("price", 0) or 0)
+                    shares_v = int(r.get("shares", 0) or 0)
+                    actual_d = float(r.get("actual_dollars", 0) or 0)
+                    actual_w = float(r.get("actual_weight", 0) or 0)
+                    drift = float(r.get("weight_drift", 0) or 0)
+                    sign = "+" if drift > 0 else ""
+                    push(
+                        f"| `{ticker}` | ${price_v:,.2f} | "
+                        f"{weight:.2%} | ${target_d:,.2f} | "
+                        f"{shares_v:,d} | ${actual_d:,.2f} | "
+                        f"{actual_w:.2%} | {sign}{drift:.2%} | ok |"
+                    )
+                else:
+                    err = r.get("error") or "unpriced"
+                    push(
+                        f"| `{ticker}` | — | {weight:.2%} | "
+                        f"${target_d:,.2f} | — | — | — | — | {err} |"
+                    )
+            push("")
+    elif pricing.get("skipped_reason"):
+        push("## Latest Prices & Lot-Size Feasibility")
+        push("")
+        push(f"_Pricing pass skipped — {pricing['skipped_reason']}._")
+        push("")
+    elif pricing.get("error"):
+        push("## Latest Prices & Lot-Size Feasibility")
+        push("")
+        push(f"_Pricing pass could not run — {pricing['error']}_")
+        push("")
+
     # ---- Per-iteration detail ----
     push("## Iteration History (detailed)")
     push("")
@@ -1475,6 +1789,8 @@ if __name__ == "__main__":
               uv run python long_running_agent/harness.py --model haiku --iterations 1
               uv run python long_running_agent/harness.py --no-refine
               uv run python long_running_agent/harness.py --no-advisor
+              uv run python long_running_agent/harness.py --no-prices
+              uv run python long_running_agent/harness.py --capital 250000
         """),
     )
     parser.add_argument(
@@ -1524,19 +1840,45 @@ if __name__ == "__main__":
             "--test implies --no-advisor."
         ),
     )
+    parser.add_argument(
+        "--no-prices",
+        action="store_true",
+        help=(
+            "Skip the post-selection Pricing pass. By default, after the "
+            "final portfolio is determined, the latest prices for each "
+            "ticker are fetched from Yahoo Finance via yfinance and a "
+            "whole-share lot-size feasibility check is performed using "
+            "--capital. Per-ticker failures degrade gracefully. "
+            "--test implies --no-prices."
+        ),
+    )
+    parser.add_argument(
+        "--capital",
+        type=float,
+        default=DEFAULT_CAPITAL,
+        metavar="USD",
+        help=(
+            f"Assumed investable capital in USD for the lot-size "
+            f"feasibility check (default ${DEFAULT_CAPITAL:,.0f}). Only "
+            f"used when pricing is enabled."
+        ),
+    )
     args = parser.parse_args()
 
     # Apply --test first (it takes precedence), then individual overrides.
     refine = not args.no_refine
     advise = not args.no_advisor
+    price = not args.no_prices
+    capital = args.capital
     if args.test:
         MODEL = _MODEL_ALIASES["haiku"]
         MAX_ITERATIONS = 1
         refine = False   # --test always implies --no-refine
         advise = False   # --test always implies --no-advisor
+        price = False    # --test always implies --no-prices
         print(
             f"[TEST MODE] model={MODEL}  iterations={MAX_ITERATIONS}  "
-            f"refine={refine}  advise={advise}"
+            f"refine={refine}  advise={advise}  price={price}"
         )
     else:
         if args.model:
@@ -1547,10 +1889,16 @@ if __name__ == "__main__":
                 parser.error("--iterations must be ≥ 1")
             MAX_ITERATIONS = args.iterations
             print(f"[iterations override] {MAX_ITERATIONS}")
+        if capital <= 0:
+            parser.error("--capital must be > 0")
         if not refine:
             print("[refinement disabled]")
         if not advise:
             print("[advisor disabled]")
+        if not price:
+            print("[pricing disabled]")
+        else:
+            print(f"[pricing enabled  capital=${capital:,.0f}]")
 
     goal = (
         "Optimise a portfolio for a US-based retail investor. "
@@ -1560,7 +1908,13 @@ if __name__ == "__main__":
         "(stocks, ETFs, bonds, options overlays, etc.)."
     )
 
-    result = run_harness(goal, refine=refine, advise=advise)
+    result = run_harness(
+        goal,
+        refine=refine,
+        advise=advise,
+        price=price,
+        capital=capital,
+    )
 
     # Dump full trace to a JSON file for inspection
     with open("harness_output.json", "w") as f:
@@ -1596,6 +1950,18 @@ if __name__ == "__main__":
             f"avg={h['average_score']:.2f}  "
             f"max_loss={h['expected_max_drawdown']:.2%}  "
             f"{passed_str}"
+        )
+
+    pricing_summary = result.get("pricing") or {}
+    if pricing_summary.get("performed"):
+        n_failed = len(pricing_summary.get("failed_tickers") or [])
+        print("\n  Lot-size feasibility (yfinance):")
+        print(
+            f"    capital=${pricing_summary.get('capital', 0):,.0f}  "
+            f"invested=${pricing_summary.get('total_invested', 0):,.2f}  "
+            f"leftover=${pricing_summary.get('leftover_cash', 0):,.2f}  "
+            f"max|Δw|={pricing_summary.get('max_abs_drift', 0):.2%}  "
+            f"unpriced={n_failed}"
         )
 
     print("\nFull trace saved to:")
