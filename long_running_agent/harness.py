@@ -345,8 +345,19 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
         "methodology_rigour": int
       },
       "critique": "Detailed critique addressing each criterion …",
-      "passed": true/false   // true only if average >= 7 AND no single score <= 4
+      "passed": true/false
     }
+
+    THE "passed" FIELD IS YOUR INDEPENDENT JUDGEMENT (not a derived rule).
+    Return passed=true ONLY if you would unconditionally recommend this
+    portfolio to a real client TODAY.  Return passed=false — even if the
+    average score is ≥ 7 — when you found ANY of:
+      • A binding hard-constraint violation (FX hedging, ticker cap,
+        sector cap, leverage, instrument restrictions, etc.).
+      • A realistic historical scenario that breaches the 5% loss limit.
+      • Material methodology gaps that make the loss estimates unreliable.
+    Your "passed" value will be combined with the numeric pass rule
+    (average ≥ 7 AND no single score ≤ 4) — all three must hold to pass.
 
     No markdown fences — raw JSON only.
 """)
@@ -378,7 +389,16 @@ def run_evaluator(
     scores = data.get("scores", {})
     avg = sum(scores.values()) / len(scores) if scores else 0
     any_critical_fail = any(v <= 4 for v in scores.values())
-    passed = avg >= PASS_THRESHOLD and not any_critical_fail
+    # Honor the evaluator's own pass/fail judgement.  The model often spots
+    # binding-constraint violations (e.g. FX hedging, ticker count) that the
+    # numeric average + min-score rule alone would let through.  Missing
+    # field defaults to False — we want an explicit "yes" from the model.
+    model_said_passed = bool(data.get("passed", False))
+    passed = (
+        avg >= PASS_THRESHOLD
+        and not any_critical_fail
+        and model_said_passed
+    )
 
     return EvaluationResult(
         passed=passed,
@@ -387,6 +407,150 @@ def run_evaluator(
         critique=data.get("critique", ""),
         raw_text=raw,
     )
+
+
+# ---------------------------------------------------------------------------
+# AGENT 4 — REFINER  (post-selection fine-tuner)
+# ---------------------------------------------------------------------------
+REFINER_SYSTEM = textwrap.dedent("""\
+    You are a senior portfolio fine-tuner.  Your input is:
+      • An investment specification.
+      • A portfolio that has already been selected as the best of several
+        candidates.
+      • A detailed critique from the QA evaluator pointing out specific
+        issues with that portfolio.
+
+    Your job is to produce a REVISED portfolio that addresses every issue
+    raised in the critique, while preserving everything the critique did
+    NOT flag.  This is a SURGICAL EDIT, not a rewrite.
+
+    Hard rules:
+    1. Maintain the ≤5% max annual loss constraint under realistic
+       historical scenarios (2008, 2020, 2022).
+    2. Aim expected_max_drawdown close to (but under) 5% — do NOT waste
+       the risk budget by becoming overly conservative.
+    3. Address EVERY distinct issue in the critique.  If the critique
+       lists three separate problems, your revision must visibly address
+       all three.
+    4. Preserve unflagged characteristics of the original portfolio:
+       keep instruments and weights that the critique did not call out,
+       unless removing them is necessary to fix something that WAS
+       flagged.
+
+    Use the rationale field to explain, point by point, how each
+    critique item was addressed.  Be concrete: "Issue X — fixed by Y".
+
+    Respond ONLY with a JSON object using the same schema as the Generator:
+    {
+      "allocations": {"TICKER_OR_ASSET": weight, ...},
+      "descriptions": {"TICKER_OR_ASSET": "one-line plain-English description", ...},
+      "expected_annual_return": float,
+      "expected_max_drawdown": float,
+      "methodology": "string",
+      "rationale": "string — must address each critique point explicitly"
+    }
+
+    The "descriptions" map must contain one entry per ticker.
+    Weights must sum to 1.0.  No markdown fences — raw JSON only.
+""")
+
+
+def run_refiner(
+    spec: InvestmentSpec,
+    selected_proposal: PortfolioProposal,
+    selected_evaluation: EvaluationResult,
+) -> PortfolioProposal:
+    """
+    Take the harness-selected portfolio plus the evaluator's critique and
+    produce a single revised proposal that addresses every critique item.
+    """
+    print("\n" + "=" * 60)
+    print("REFINER — fine-tuning the selected portfolio against critique …")
+    print("=" * 60)
+
+    user_msg = (
+        f"INVESTMENT SPEC:\n{spec.raw_text}\n\n"
+        f"SELECTED PORTFOLIO (currently best of {MAX_ITERATIONS}):\n"
+        f"{selected_proposal.raw_text}\n\n"
+        f"EVALUATOR SCORES: {selected_evaluation.scores} "
+        f"(average {selected_evaluation.average_score})\n"
+        f"EVALUATOR PASS JUDGEMENT: {selected_evaluation.passed}\n\n"
+        f"DETAILED CRITIQUE TO ADDRESS:\n{selected_evaluation.critique}\n\n"
+        f"Produce a revised portfolio that fixes every issue above while "
+        f"preserving the rest.  Spell out in `rationale` how each critique "
+        f"point was addressed."
+    )
+
+    raw = call_claude(REFINER_SYSTEM, user_msg)
+    print(raw[:600], "…\n" if len(raw) > 600 else "\n")
+
+    try:
+        data = json.loads(raw, strict=False)
+    except json.JSONDecodeError:
+        import re
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        data = json.loads(m.group(), strict=False) if m else {}
+
+    return PortfolioProposal(
+        allocations=data.get("allocations", {}),
+        descriptions=data.get("descriptions", {}),
+        expected_annual_return=data.get("expected_annual_return", 0),
+        expected_max_drawdown=data.get("expected_max_drawdown", 0),
+        methodology=data.get("methodology", ""),
+        rationale=data.get("rationale", ""),
+        raw_text=raw,
+    )
+
+
+def _refinement_improvements(
+    orig_eval: EvaluationResult,
+    refined_eval: EvaluationResult,
+    orig_proposal: PortfolioProposal,
+    refined_proposal: PortfolioProposal,
+) -> dict[str, Any]:
+    """Compute a structured before/after diff for the markdown report."""
+    score_deltas: dict[str, dict[str, float]] = {}
+    all_keys = set(orig_eval.scores) | set(refined_eval.scores)
+    for k in all_keys:
+        before = orig_eval.scores.get(k, 0)
+        after = refined_eval.scores.get(k, 0)
+        score_deltas[k] = {
+            "before": before,
+            "after": after,
+            "delta": round(after - before, 2),
+        }
+
+    orig_w = orig_proposal.allocations
+    new_w = refined_proposal.allocations
+    all_tickers = set(orig_w) | set(new_w)
+    allocation_changes: list[dict[str, Any]] = []
+    for t in sorted(all_tickers, key=lambda x: -abs(new_w.get(x, 0) - orig_w.get(x, 0))):
+        before = float(orig_w.get(t, 0))
+        after = float(new_w.get(t, 0))
+        if abs(after - before) < 1e-9:
+            continue  # unchanged
+        kind = "added" if before == 0 else "removed" if after == 0 else "changed"
+        allocation_changes.append({
+            "ticker": t,
+            "before": before,
+            "after": after,
+            "delta": round(after - before, 4),
+            "kind": kind,
+        })
+
+    return {
+        "score_deltas": score_deltas,
+        "average_score_before": orig_eval.average_score,
+        "average_score_after": refined_eval.average_score,
+        "average_score_delta": round(refined_eval.average_score - orig_eval.average_score, 2),
+        "expected_return_before": orig_proposal.expected_annual_return,
+        "expected_return_after": refined_proposal.expected_annual_return,
+        "expected_max_drawdown_before": orig_proposal.expected_max_drawdown,
+        "expected_max_drawdown_after": refined_proposal.expected_max_drawdown,
+        "passed_before": orig_eval.passed,
+        "passed_after": refined_eval.passed,
+        "allocation_changes": allocation_changes,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -468,16 +632,23 @@ def _select_best_iteration(history: list[dict]) -> int | None:
     return best["iteration"]
 
 
-def run_harness(user_goal: str) -> dict[str, Any]:
+def run_harness(user_goal: str, *, refine: bool = True) -> dict[str, Any]:
     """
-    Main entry point.  Runs the full Planner → Generator ↔ Evaluator loop.
+    Main entry point.  Runs the full Planner → Generator ↔ Evaluator loop,
+    then (by default) a post-selection REFINER pass.
 
-    Unlike the original harness, this version ALWAYS runs MAX_ITERATIONS
-    rounds, even if QA passes earlier.  After the loop completes, it
-    selects the passing iteration whose expected_max_drawdown is closest
-    to TARGET_MAX_LOSS.  If no iteration passes, the last iteration is
-    returned (matching the original "max iterations without passing"
-    behaviour).
+    Flow:
+      1. Planner expands the goal into a full investment spec.
+      2. MAX_ITERATIONS rounds of Generator ↔ Evaluator.  Always runs
+         all rounds; never breaks early.
+      3. Select the best PASSING iteration whose expected_max_drawdown
+         is closest to TARGET_MAX_LOSS.  Falls back to the last iteration
+         if nothing passed.
+      4. If `refine=True`, run a single Refiner pass on the selected
+         portfolio: Refiner addresses every critique point, then the
+         Evaluator re-scores.  If the refined version passes QA, it is
+         PROMOTED to `final_proposal`; otherwise the selected one stays
+         as the final answer.
     """
     # --- Step 1: Plan ---
     spec = run_planner(user_goal)
@@ -539,31 +710,102 @@ def run_harness(user_goal: str) -> dict[str, Any]:
 
     if selected_idx is not None:
         history[selected_idx - 1]["selected"] = True
-        final_proposal = proposals[selected_idx - 1]
-        final_evaluation = evaluations[selected_idx - 1]
+        selected_proposal = proposals[selected_idx - 1]
+        selected_evaluation = evaluations[selected_idx - 1]
         print(
             f"\n🎯  Selected iteration {selected_idx} of {MAX_ITERATIONS}: "
             f"passing portfolio with expected_max_drawdown "
-            f"{final_proposal.expected_max_drawdown:.2%} "
+            f"{selected_proposal.expected_max_drawdown:.2%} "
             f"(closest to {TARGET_MAX_LOSS:.0%} target).\n"
         )
     else:
         # Fall back to the last iteration when nothing passed.
         history[-1]["selected"] = True
-        final_proposal = proposals[-1]
-        final_evaluation = evaluations[-1]
+        selected_proposal = proposals[-1]
+        selected_evaluation = evaluations[-1]
         print(
             f"\n⚠️  Reached max iterations ({MAX_ITERATIONS}) without any "
             f"passing portfolio. Returning last iteration.\n"
         )
+
+    # --- Step 5: Post-selection Refinement ---
+    final_proposal = selected_proposal
+    final_evaluation = selected_evaluation
+    refinement_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "promoted": False,
+        "refined_proposal": None,
+        "refined_evaluation": None,
+        "improvements": None,
+    }
+
+    if not refine:
+        refinement_block["skipped_reason"] = "disabled via --no-refine / --test"
+        print("\n(Refinement step skipped.)\n")
+    elif not selected_evaluation.critique:
+        refinement_block["skipped_reason"] = "no critique available to refine against"
+        print("\n(Refinement step skipped — no critique available.)\n")
+    else:
+        refined_proposal = run_refiner(spec, selected_proposal, selected_evaluation)
+        refined_evaluation = run_evaluator(spec, refined_proposal)
+
+        print(f"\n--- Refinement result ---")
+        print(f"  Scores              : {refined_evaluation.scores}")
+        print(f"  Average             : {refined_evaluation.average_score}")
+        print(f"  Passed              : {refined_evaluation.passed}")
+        print(f"  Expected max loss   : {refined_proposal.expected_max_drawdown:.2%}")
+
+        improvements = _refinement_improvements(
+            selected_evaluation, refined_evaluation,
+            selected_proposal, refined_proposal,
+        )
+
+        # Promote the refined version only if it passes QA AND its drawdown
+        # is still within the target (we don't want refinement to wander out
+        # of the risk budget while "fixing" things).
+        refined_dd = float(refined_proposal.expected_max_drawdown or 0)
+        promote = (
+            refined_evaluation.passed
+            and refined_dd <= TARGET_MAX_LOSS
+        )
+
+        refinement_block.update({
+            "performed": True,
+            "promoted": promote,
+            "refined_proposal": asdict(refined_proposal),
+            "refined_evaluation": asdict(refined_evaluation),
+            "improvements": improvements,
+        })
+
+        if promote:
+            final_proposal = refined_proposal
+            final_evaluation = refined_evaluation
+            print(
+                f"\n✨  Refined portfolio PROMOTED to final "
+                f"(passed QA, drawdown {refined_dd:.2%} ≤ {TARGET_MAX_LOSS:.0%}).\n"
+            )
+        else:
+            reasons = []
+            if not refined_evaluation.passed:
+                reasons.append("failed QA")
+            if refined_dd > TARGET_MAX_LOSS:
+                reasons.append(f"drawdown {refined_dd:.2%} > target")
+            print(
+                f"\n🔒  Refined version NOT promoted ({', '.join(reasons)}). "
+                f"Keeping selected iteration {selected_idx} as final.\n"
+            )
 
     return {
         "spec": asdict(spec),
         "final_proposal": asdict(final_proposal),
         "final_evaluation": asdict(final_evaluation),
         "selected_iteration": selected_idx,
+        "selected_proposal": asdict(selected_proposal),
+        "selected_evaluation": asdict(selected_evaluation),
         "target_max_loss": TARGET_MAX_LOSS,
         "iteration_history": history,
+        "refinement": refinement_block,
     }
 
 
@@ -600,6 +842,8 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
     history = result.get("iteration_history") or []
     sel = result.get("selected_iteration")
     target = result.get("target_max_loss", TARGET_MAX_LOSS)
+    refinement = result.get("refinement") or {}
+    refined_promoted = bool(refinement.get("promoted"))
 
     out: list[str] = []
     push = out.append
@@ -614,12 +858,22 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
         push(f"- **Selected iteration:** {sel} — best passing portfolio, closest to {target:.1%} target")
     else:
         push("- **Selected iteration:** last (no iteration passed QA — see fallback note below)")
+    if refinement.get("performed"):
+        if refined_promoted:
+            push("- **Refinement:** performed — refined portfolio PROMOTED to final")
+        else:
+            push("- **Refinement:** performed — refined version NOT promoted (kept selected as final)")
+    elif refinement.get("skipped_reason"):
+        push(f"- **Refinement:** skipped ({refinement['skipped_reason']})")
     push(f"- **Target max loss:** {target:.1%}")
-    push(f"- **Pass threshold:** average score ≥ {PASS_THRESHOLD} with no single score ≤ 4")
+    push(f"- **Pass threshold:** average score ≥ {PASS_THRESHOLD} with no single score ≤ 4 AND evaluator says passed")
     push("")
 
     # ---- Final portfolio ----
-    push("## Final Portfolio (selected)")
+    if refined_promoted:
+        push("## Final Portfolio (refined)")
+    else:
+        push("## Final Portfolio (selected)")
     push("")
     allocs = final_p.get("allocations") or {}
     descs = final_p.get("descriptions") or {}
@@ -739,6 +993,152 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
         push("</details>")
         push("")
 
+    # ---- Post-selection refinement ----
+    if refinement.get("performed"):
+        push("## Post-Selection Refinement")
+        push("")
+        if refined_promoted:
+            push(
+                "The Refiner addressed every critique point above and the "
+                "Evaluator re-scored the result. **The refined portfolio "
+                "passed QA and was promoted to `Final Portfolio` (top of "
+                "this report).** Section below shows the before/after."
+            )
+        else:
+            push(
+                "The Refiner addressed every critique point above, but the "
+                "refined portfolio **did not pass QA on re-evaluation** (or "
+                "exceeded the 5% drawdown target), so the originally "
+                "selected portfolio was kept as the final answer. Section "
+                "below shows what the Refiner produced for comparison."
+            )
+        push("")
+
+        imp = refinement.get("improvements") or {}
+        ref_p = refinement.get("refined_proposal") or {}
+        ref_e = refinement.get("refined_evaluation") or {}
+
+        # Score deltas table
+        score_deltas = imp.get("score_deltas") or {}
+        if score_deltas:
+            push("### Score deltas (Selected → Refined)")
+            push("")
+            push("| Criterion | Selected | Refined | Δ |")
+            push("|-----------|---------:|--------:|--:|")
+            for k, d in score_deltas.items():
+                delta = d.get("delta", 0)
+                sign = "+" if delta > 0 else ""
+                push(
+                    f"| {k.replace('_', ' ')} | {d.get('before', '?')} | "
+                    f"{d.get('after', '?')} | {sign}{delta} |"
+                )
+            avg_b = imp.get("average_score_before", 0)
+            avg_a = imp.get("average_score_after", 0)
+            avg_d = imp.get("average_score_delta", 0)
+            sign = "+" if avg_d > 0 else ""
+            push(f"| **Average** | **{avg_b}** | **{avg_a}** | **{sign}{avg_d}** |")
+            push("")
+
+        # Headline metric deltas
+        push("### Portfolio metric deltas")
+        push("")
+        try:
+            er_b = float(imp.get("expected_return_before", 0))
+            er_a = float(imp.get("expected_return_after", 0))
+            dd_b = float(imp.get("expected_max_drawdown_before", 0))
+            dd_a = float(imp.get("expected_max_drawdown_after", 0))
+            push("| Metric | Selected | Refined | Δ |")
+            push("|--------|---------:|--------:|--:|")
+            push(
+                f"| Expected annual return | {er_b:.2%} | {er_a:.2%} | "
+                f"{'+' if er_a >= er_b else ''}{(er_a - er_b):.2%} |"
+            )
+            push(
+                f"| Expected max drawdown | {dd_b:.2%} | {dd_a:.2%} | "
+                f"{'+' if dd_a >= dd_b else ''}{(dd_a - dd_b):.2%} |"
+            )
+            push(
+                f"| Distance to {target:.0%} target | "
+                f"{abs(dd_b - target):.2%} | {abs(dd_a - target):.2%} | "
+                f"{'+' if abs(dd_a - target) >= abs(dd_b - target) else ''}"
+                f"{(abs(dd_a - target) - abs(dd_b - target)):.2%} |"
+            )
+            push(
+                f"| Passed QA | {imp.get('passed_before')} | "
+                f"{imp.get('passed_after')} | — |"
+            )
+            push("")
+        except (TypeError, ValueError):
+            push("_(Could not compute metric deltas — see raw values below.)_")
+            push("")
+
+        # Allocation changes
+        changes = imp.get("allocation_changes") or []
+        if changes:
+            push("### Allocation changes")
+            push("")
+            push("| Ticker | Selected | Refined | Δ Weight | Kind |")
+            push("|--------|---------:|--------:|---------:|------|")
+            for c in changes:
+                before = float(c.get("before", 0))
+                after = float(c.get("after", 0))
+                delta = float(c.get("delta", 0))
+                sign = "+" if delta > 0 else ""
+                before_s = f"{before:.2%}" if before > 0 else "—"
+                after_s = f"{after:.2%}" if after > 0 else "—"
+                push(
+                    f"| `{c.get('ticker')}` | {before_s} | {after_s} | "
+                    f"{sign}{delta:.2%} | {c.get('kind')} |"
+                )
+            push("")
+
+        # Refined methodology / rationale
+        if ref_p.get("methodology"):
+            push("### Refined methodology")
+            push("")
+            push(_format_value(ref_p["methodology"]))
+            push("")
+        if ref_p.get("rationale"):
+            push("### Refined rationale (point-by-point response to critique)")
+            push("")
+            push(_format_value(ref_p["rationale"]))
+            push("")
+
+        # Refined evaluator report
+        if ref_e.get("scores"):
+            push("### Re-evaluator scores")
+            push("")
+            push("| Criterion | Score |")
+            push("|-----------|------:|")
+            for k, v in ref_e["scores"].items():
+                push(f"| {k.replace('_', ' ')} | {v} |")
+            push(f"| **Average** | **{ref_e.get('average_score', 0)}** |")
+            push(f"| **Passed** | **{ref_e.get('passed', False)}** |")
+            push("")
+        if ref_e.get("critique"):
+            push("### Re-evaluator critique")
+            push("")
+            push(_format_value(ref_e["critique"]))
+            push("")
+
+        if ref_p.get("raw_text") or ref_e.get("raw_text"):
+            push("<details><summary>Refiner & re-evaluator raw responses</summary>")
+            push("")
+            if ref_p.get("raw_text"):
+                push("```")
+                push("--- Refiner raw response ---")
+                push(ref_p["raw_text"].rstrip())
+                push("```")
+                push("")
+            if ref_e.get("raw_text"):
+                push("```")
+                push("--- Re-evaluator raw response ---")
+                push(ref_e["raw_text"].rstrip())
+                push("```")
+                push("")
+            push("</details>")
+            push("")
+
     # ---- Per-iteration detail ----
     push("## Iteration History (detailed)")
     push("")
@@ -818,6 +1218,7 @@ if __name__ == "__main__":
               uv run python long_running_agent/harness.py --test
               uv run python long_running_agent/harness.py --model sonnet
               uv run python long_running_agent/harness.py --model haiku --iterations 1
+              uv run python long_running_agent/harness.py --no-refine
         """),
     )
     parser.add_argument(
@@ -846,13 +1247,25 @@ if __name__ == "__main__":
             f"{MAX_ITERATIONS}). Ignored when --test is also set."
         ),
     )
+    parser.add_argument(
+        "--no-refine",
+        action="store_true",
+        help=(
+            "Skip the post-selection Refiner pass. By default, after the best "
+            "iteration is selected, a Refiner agent addresses every critique "
+            "point and the Evaluator re-scores; --no-refine disables that. "
+            "--test implies --no-refine."
+        ),
+    )
     args = parser.parse_args()
 
     # Apply --test first (it takes precedence), then individual overrides.
+    refine = not args.no_refine
     if args.test:
         MODEL = _MODEL_ALIASES["haiku"]
         MAX_ITERATIONS = 1
-        print(f"[TEST MODE] model={MODEL}  iterations={MAX_ITERATIONS}")
+        refine = False  # --test always implies --no-refine
+        print(f"[TEST MODE] model={MODEL}  iterations={MAX_ITERATIONS}  refine={refine}")
     else:
         if args.model:
             MODEL = _MODEL_ALIASES.get(args.model, args.model)
@@ -862,6 +1275,8 @@ if __name__ == "__main__":
                 parser.error("--iterations must be ≥ 1")
             MAX_ITERATIONS = args.iterations
             print(f"[iterations override] {MAX_ITERATIONS}")
+        if not refine:
+            print("[refinement disabled]")
 
     goal = (
         "Optimise a portfolio for a US-based retail investor. "
@@ -871,7 +1286,7 @@ if __name__ == "__main__":
         "(stocks, ETFs, bonds, options overlays, etc.)."
     )
 
-    result = run_harness(goal)
+    result = run_harness(goal, refine=refine)
 
     # Dump full trace to a JSON file for inspection
     with open("harness_output.json", "w") as f:
