@@ -105,6 +105,23 @@ class EvaluationResult:
     raw_text: str = ""
 
 
+@dataclass
+class AdvisorOutput:
+    """
+    Produced by the Advisor.  Pure advisory — never changes the portfolio.
+    Surfaces highly correlated holdings in the FINAL portfolio and offers
+    concrete consolidation ideas with explicit trade-offs.
+    """
+    # List of {"merge_from": [tickers], "merge_into": ticker,
+    #          "rationale": str, "tradeoff": str}
+    suggestions: list[dict[str, Any]] = field(default_factory=list)
+    # List of {"a": ticker_a, "b": ticker_b, "rho": float,
+    #          "note": optional str}
+    correlation_pairs: list[dict[str, Any]] = field(default_factory=list)
+    notes: str = ""
+    raw_text: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Helper: call the Anthropic API
 # ---------------------------------------------------------------------------
@@ -554,6 +571,108 @@ def _refinement_improvements(
 
 
 # ---------------------------------------------------------------------------
+# AGENT 5 — ADVISOR  (advisory only, never modifies the portfolio)
+# ---------------------------------------------------------------------------
+ADVISOR_SYSTEM = textwrap.dedent("""\
+    You are a portfolio diversification advisor.  You are NOT allowed to
+    change the portfolio.  Your single job is to look at the FINAL
+    portfolio (which has already passed QA or been chosen as the best
+    effort) and surface two things for the human reader:
+
+    1. A pairwise CORRELATION SNAPSHOT for tickers that move similarly.
+       For every PAIR of holdings whose long-run correlation is |ρ| ≥ 0.5,
+       output an entry.  Use realistic historical correlations (you may
+       approximate from memory; this is a snapshot, not a backtest).
+       Be honest about uncertainty — these are model-recalled, not
+       computed from data.
+
+    2. Concrete SIMPLIFICATION SUGGESTIONS.  For each cluster of highly
+       correlated holdings (typically ρ ≥ 0.75) that look redundant,
+       propose a specific consolidation.
+
+    HARD RULES for suggestions:
+    • Suggest a REAL replacement ticker (e.g., GOVT, AGG, VXUS, BNDX)
+      that a US retail investor can buy easily.  Do not invent tickers.
+    • Be EXPLICIT about what the user gives up — every suggestion MUST
+      include a "tradeoff" string.  Examples of legitimate tradeoffs:
+        "Loses the explicit short/intermediate Treasury barbell."
+        "Loses tax-exempt muni income exposure."
+        "Combines investment-grade credit with Treasuries — credit risk
+         becomes implicit rather than sized separately."
+    • Do NOT suggest consolidations across genuinely different risk
+      factors (e.g., merging LQD into IEF collapses credit and rate
+      exposure — flag it as a NOT-recommended merge if you mention it).
+    • If the portfolio is already well-consolidated, return an empty
+      "suggestions" list rather than inventing weak ideas.
+
+    Respond ONLY with a JSON object:
+    {
+      "correlation_pairs": [
+        {"a": "TICKER_A", "b": "TICKER_B", "rho": 0.85,
+         "note": "optional short context"},
+        ...
+      ],
+      "suggestions": [
+        {
+          "merge_from": ["TICKER_X", "TICKER_Y"],
+          "merge_into": "REPLACEMENT_TICKER",
+          "rationale": "one-sentence why they overlap",
+          "tradeoff": "explicit description of what is lost"
+        },
+        ...
+      ],
+      "notes": "optional caveats about correlation estimates / regime sensitivity"
+    }
+
+    No markdown fences — raw JSON only.
+""")
+
+
+def run_advisor(final_proposal: PortfolioProposal) -> AdvisorOutput:
+    """
+    Inspect the final portfolio and produce advisory consolidation
+    suggestions plus a pairwise correlation snapshot.  Never modifies
+    the portfolio itself.
+    """
+    print("\n" + "=" * 60)
+    print("ADVISOR — scanning final portfolio for correlation / simplification …")
+    print("=" * 60)
+
+    # Build a compact view of the holdings (ticker, weight, description)
+    rows = []
+    descs = final_proposal.descriptions or {}
+    for ticker, weight in final_proposal.allocations.items():
+        desc = descs.get(ticker, "")
+        rows.append(f"  {ticker:30s}  {float(weight):.2%}   {desc}")
+    holdings_block = "\n".join(rows) if rows else "  (empty)"
+
+    user_msg = (
+        f"FINAL PORTFOLIO (do NOT modify — advise only):\n{holdings_block}\n\n"
+        f"Produce the correlation snapshot and simplification suggestions "
+        f"per the system prompt schema.  Focus on pairs that move together "
+        f"in normal regimes; flag (in notes) any pairs whose correlation "
+        f"changes materially in stress."
+    )
+
+    raw = call_claude(ADVISOR_SYSTEM, user_msg)
+    print(raw[:500], "…\n" if len(raw) > 500 else "\n")
+
+    try:
+        data = json.loads(raw, strict=False)
+    except json.JSONDecodeError:
+        import re
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        data = json.loads(m.group(), strict=False) if m else {}
+
+    return AdvisorOutput(
+        suggestions=data.get("suggestions", []) or [],
+        correlation_pairs=data.get("correlation_pairs", []) or [],
+        notes=data.get("notes", "") or "",
+        raw_text=raw,
+    )
+
+
+# ---------------------------------------------------------------------------
 # ORCHESTRATOR — the harness loop
 # ---------------------------------------------------------------------------
 def _build_feedback(evaluation: EvaluationResult, proposal: PortfolioProposal) -> str:
@@ -632,10 +751,15 @@ def _select_best_iteration(history: list[dict]) -> int | None:
     return best["iteration"]
 
 
-def run_harness(user_goal: str, *, refine: bool = True) -> dict[str, Any]:
+def run_harness(
+    user_goal: str,
+    *,
+    refine: bool = True,
+    advise: bool = True,
+) -> dict[str, Any]:
     """
     Main entry point.  Runs the full Planner → Generator ↔ Evaluator loop,
-    then (by default) a post-selection REFINER pass.
+    then (by default) a post-selection REFINER pass and an ADVISOR pass.
 
     Flow:
       1. Planner expands the goal into a full investment spec.
@@ -649,6 +773,11 @@ def run_harness(user_goal: str, *, refine: bool = True) -> dict[str, Any]:
          Evaluator re-scores.  If the refined version passes QA, it is
          PROMOTED to `final_proposal`; otherwise the selected one stays
          as the final answer.
+      5. If `advise=True`, run a single ADVISOR pass on the final
+         portfolio.  The Advisor is read-only — it never modifies the
+         portfolio.  It returns a pairwise correlation snapshot and a
+         list of structured "merge X+Y into Z" suggestions with explicit
+         trade-offs, so the human reader can decide whether to apply any.
     """
     # --- Step 1: Plan ---
     spec = run_planner(user_goal)
@@ -796,6 +925,38 @@ def run_harness(user_goal: str, *, refine: bool = True) -> dict[str, Any]:
                 f"Keeping selected iteration {selected_idx} as final.\n"
             )
 
+    # --- Step 6: Advisor (read-only, advisory only) ---
+    advisor_block: dict[str, Any] = {
+        "performed": False,
+        "skipped_reason": None,
+        "suggestions": [],
+        "correlation_pairs": [],
+        "notes": "",
+        "raw_text": "",
+    }
+    if not advise:
+        advisor_block["skipped_reason"] = "disabled via --no-advisor / --test"
+        print("\n(Advisor step skipped.)\n")
+    elif not final_proposal.allocations:
+        advisor_block["skipped_reason"] = "no allocations to advise on"
+        print("\n(Advisor step skipped — no allocations.)\n")
+    else:
+        advisor_output = run_advisor(final_proposal)
+        advisor_block.update({
+            "performed": True,
+            "suggestions": advisor_output.suggestions,
+            "correlation_pairs": advisor_output.correlation_pairs,
+            "notes": advisor_output.notes,
+            "raw_text": advisor_output.raw_text,
+        })
+        n_pairs = len(advisor_output.correlation_pairs)
+        n_sugg = len(advisor_output.suggestions)
+        print(
+            f"\n💡  Advisor returned {n_pairs} correlated pair(s) and "
+            f"{n_sugg} consolidation suggestion(s).  The portfolio was "
+            f"NOT modified — see the report for details.\n"
+        )
+
     return {
         "spec": asdict(spec),
         "final_proposal": asdict(final_proposal),
@@ -806,6 +967,7 @@ def run_harness(user_goal: str, *, refine: bool = True) -> dict[str, Any]:
         "target_max_loss": TARGET_MAX_LOSS,
         "iteration_history": history,
         "refinement": refinement_block,
+        "advisor": advisor_block,
     }
 
 
@@ -865,6 +1027,16 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
             push("- **Refinement:** performed — refined version NOT promoted (kept selected as final)")
     elif refinement.get("skipped_reason"):
         push(f"- **Refinement:** skipped ({refinement['skipped_reason']})")
+    advisor_hdr = result.get("advisor") or {}
+    if advisor_hdr.get("performed"):
+        n_sugg = len(advisor_hdr.get("suggestions") or [])
+        n_pairs = len(advisor_hdr.get("correlation_pairs") or [])
+        push(
+            f"- **Advisor:** performed — {n_sugg} consolidation "
+            f"suggestion(s), {n_pairs} correlated pair(s) (advisory only)"
+        )
+    elif advisor_hdr.get("skipped_reason"):
+        push(f"- **Advisor:** skipped ({advisor_hdr['skipped_reason']})")
     push(f"- **Target max loss:** {target:.1%}")
     push(f"- **Pass threshold:** average score ≥ {PASS_THRESHOLD} with no single score ≤ 4 AND evaluator says passed")
     push("")
@@ -1139,6 +1311,89 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
             push("</details>")
             push("")
 
+    # ---- Advisor (simplification suggestions + correlation snapshot) ----
+    advisor = result.get("advisor") or {}
+    if advisor.get("performed"):
+        push("## Simplification Suggestions (advisory — not applied)")
+        push("")
+        push(
+            "The Advisor inspected the **final portfolio** and produced "
+            "the suggestions below.  These are advisory only — the "
+            "portfolio above has NOT been modified.  Decide which (if "
+            "any) to apply yourself."
+        )
+        push("")
+
+        suggestions = advisor.get("suggestions") or []
+        if suggestions:
+            for idx, s in enumerate(suggestions, start=1):
+                merge_from = s.get("merge_from") or []
+                merge_into = s.get("merge_into") or ""
+                from_str = ", ".join(f"`{t}`" for t in merge_from) or "_(none)_"
+                push(f"### Suggestion {idx}: {from_str} → `{merge_into}`")
+                push("")
+                if s.get("rationale"):
+                    push(f"- **Why:** {s['rationale']}")
+                if s.get("tradeoff"):
+                    push(f"- **Tradeoff:** {s['tradeoff']}")
+                push("")
+        else:
+            push("_The Advisor did not propose any consolidations — the "
+                 "portfolio is already well-organised by this measure._")
+            push("")
+
+        pairs = advisor.get("correlation_pairs") or []
+        if pairs:
+            push("### Correlation snapshot")
+            push("")
+            push(
+                "Approximate long-run correlations (model-recalled, not "
+                "computed).  Pairs with |ρ| ≥ 0.5 are shown; sorted by "
+                "strongest first."
+            )
+            push("")
+            push("| Ticker A | Ticker B | ρ | Note |")
+            push("|----------|----------|---:|------|")
+            try:
+                pairs_sorted = sorted(
+                    pairs,
+                    key=lambda p: -abs(float(p.get("rho", 0))),
+                )
+            except (TypeError, ValueError):
+                pairs_sorted = pairs
+            for p in pairs_sorted:
+                try:
+                    rho = float(p.get("rho", 0))
+                    rho_s = f"{rho:+.2f}"
+                except (TypeError, ValueError):
+                    rho_s = str(p.get("rho", ""))
+                push(
+                    f"| `{p.get('a', '')}` | `{p.get('b', '')}` | "
+                    f"{rho_s} | {p.get('note', '') or ''} |"
+                )
+            push("")
+
+        if advisor.get("notes"):
+            push("### Advisor notes")
+            push("")
+            push(_format_value(advisor["notes"]))
+            push("")
+
+        if advisor.get("raw_text"):
+            push("<details><summary>Advisor raw response</summary>")
+            push("")
+            push("```")
+            push(advisor["raw_text"].rstrip())
+            push("```")
+            push("")
+            push("</details>")
+            push("")
+    elif advisor.get("skipped_reason"):
+        push("## Simplification Suggestions (advisory)")
+        push("")
+        push(f"_Advisor pass skipped — {advisor['skipped_reason']}._")
+        push("")
+
     # ---- Per-iteration detail ----
     push("## Iteration History (detailed)")
     push("")
@@ -1219,6 +1474,7 @@ if __name__ == "__main__":
               uv run python long_running_agent/harness.py --model sonnet
               uv run python long_running_agent/harness.py --model haiku --iterations 1
               uv run python long_running_agent/harness.py --no-refine
+              uv run python long_running_agent/harness.py --no-advisor
         """),
     )
     parser.add_argument(
@@ -1257,15 +1513,31 @@ if __name__ == "__main__":
             "--test implies --no-refine."
         ),
     )
+    parser.add_argument(
+        "--no-advisor",
+        action="store_true",
+        help=(
+            "Skip the post-selection Advisor pass. By default, after the "
+            "final portfolio is determined, an Advisor agent produces a "
+            "pairwise correlation snapshot and concrete consolidation "
+            "suggestions (advisory only — never modifies the portfolio). "
+            "--test implies --no-advisor."
+        ),
+    )
     args = parser.parse_args()
 
     # Apply --test first (it takes precedence), then individual overrides.
     refine = not args.no_refine
+    advise = not args.no_advisor
     if args.test:
         MODEL = _MODEL_ALIASES["haiku"]
         MAX_ITERATIONS = 1
-        refine = False  # --test always implies --no-refine
-        print(f"[TEST MODE] model={MODEL}  iterations={MAX_ITERATIONS}  refine={refine}")
+        refine = False   # --test always implies --no-refine
+        advise = False   # --test always implies --no-advisor
+        print(
+            f"[TEST MODE] model={MODEL}  iterations={MAX_ITERATIONS}  "
+            f"refine={refine}  advise={advise}"
+        )
     else:
         if args.model:
             MODEL = _MODEL_ALIASES.get(args.model, args.model)
@@ -1277,6 +1549,8 @@ if __name__ == "__main__":
             print(f"[iterations override] {MAX_ITERATIONS}")
         if not refine:
             print("[refinement disabled]")
+        if not advise:
+            print("[advisor disabled]")
 
     goal = (
         "Optimise a portfolio for a US-based retail investor. "
@@ -1286,7 +1560,7 @@ if __name__ == "__main__":
         "(stocks, ETFs, bonds, options overlays, etc.)."
     )
 
-    result = run_harness(goal, refine=refine)
+    result = run_harness(goal, refine=refine, advise=advise)
 
     # Dump full trace to a JSON file for inspection
     with open("harness_output.json", "w") as f:
