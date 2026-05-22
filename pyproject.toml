@@ -13,11 +13,11 @@ dependencies = [
     "pandas>=2.2.0",
     "pytest>=8.4.1",
     "pytest-asyncio>=1.0.0",
+    "yfinance>=0.2.40",
     "zev>=0.8.1",
 ]
 
 [tool.uv.workspace]
 members = [
     "pdf_parser",
-    "long_running_agent",
 ]
