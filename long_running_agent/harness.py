@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import sys
 import textwrap
 import time
@@ -29,11 +30,18 @@ from typing import Any
 
 import anthropic
 
+from report import write_markdown_report
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 MODEL = "claude-opus-4-7"
 MAX_TOKENS = 4096
+# The Refiner emits a full portfolio (allocations + descriptions + numbers)
+# AND a point-by-point response to every critique item — by far the most
+# output-heavy agent.  4096 tokens regularly truncates mid-string, which
+# previously crashed the JSON parser.  Give it more headroom.
+REFINER_MAX_TOKENS = 8192
 MAX_ITERATIONS = 3          # generator ↔ evaluator rounds
 PASS_THRESHOLD = 7          # minimum average score (out of 10) to pass QA
 TARGET_MAX_LOSS = 0.05      # 5% — the loss budget we want expected_max_drawdown to land on
@@ -179,21 +187,39 @@ def _is_retryable(exc: BaseException) -> bool:
     return False
 
 
-def call_claude(system: str, user: str) -> str:
+def call_claude(
+    system: str,
+    user: str,
+    *,
+    max_tokens: int = MAX_TOKENS,
+) -> str:
     """
     Wrapper around the Messages API with exponential-backoff retry on
     transient errors (529 Overloaded, 429 rate limits, 5xx, connection
     blips).  Re-raises immediately on terminal errors (auth, bad request,
     etc.) so we fail fast on real bugs.
+
+    ``max_tokens`` defaults to the module-level ``MAX_TOKENS`` but agents
+    that emit larger outputs (notably the Refiner) can request more so
+    their JSON responses don't truncate mid-string.
     """
     for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
         try:
             resp = client.messages.create(
                 model=MODEL,
-                max_tokens=MAX_TOKENS,
+                max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": user}],
             )
+            # Surface truncation explicitly — otherwise it presents as
+            # malformed JSON downstream and is hard to diagnose.
+            if getattr(resp, "stop_reason", None) == "max_tokens":
+                print(
+                    f"  ⚠️  Response hit max_tokens={max_tokens} — output "
+                    f"likely truncated. Consider raising max_tokens for "
+                    f"this call.",
+                    flush=True,
+                )
             return resp.content[0].text
         except Exception as exc:
             if attempt == RETRY_MAX_ATTEMPTS or not _is_retryable(exc):
@@ -215,6 +241,49 @@ def call_claude(system: str, user: str) -> str:
     # The loop only exits via return or raise — this is unreachable but
     # satisfies static analysers.
     raise RuntimeError("call_claude retry loop exited unexpectedly")
+
+
+# ---------------------------------------------------------------------------
+# Helper: best-effort JSON parse for model responses
+# ---------------------------------------------------------------------------
+def _parse_json_response(raw: str, *, agent: str = "agent") -> dict[str, Any]:
+    """
+    Parse a model response that's supposed to be JSON.  Two attempts:
+
+      1. Strict ``json.loads`` on the whole string.
+      2. Greedy ``{...}`` regex extract, then ``json.loads`` on that span.
+
+    If BOTH fail (e.g., the response was truncated mid-string by
+    ``max_tokens`` and the regex picks up a partial slice), this function
+    logs a clear diagnostic and returns ``{}`` so the caller can degrade
+    gracefully — the orchestrator already handles empty/missing fields
+    via dataclass defaults.
+
+    The ``agent`` label is only used for the log message.
+    """
+    # Attempt 1: strict parse
+    try:
+        return json.loads(raw, strict=False)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: greedy regex fallback
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(), strict=False)
+        except json.JSONDecodeError:
+            pass
+
+    # Total failure — log and degrade gracefully.
+    print(
+        f"  ⚠️  {agent}: could not parse JSON from response "
+        f"({len(raw):,} chars). Returning empty dict so the pipeline "
+        f"continues. First 300 chars of response follow:\n"
+        f"  {raw[:300]!r}",
+        flush=True,
+    )
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -249,13 +318,7 @@ def run_planner(user_goal: str) -> InvestmentSpec:
     raw = call_claude(PLANNER_SYSTEM, user_goal)
     print(raw[:500], "…\n" if len(raw) > 500 else "\n")
 
-    try:
-        data = json.loads(raw, strict=False)
-    except json.JSONDecodeError:
-        # Model sometimes wraps in markdown fences
-        import re
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        data = json.loads(m.group(), strict=False) if m else {}
+    data = _parse_json_response(raw, agent="planner")
 
     return InvestmentSpec(
         objective=data.get("objective", ""),
@@ -334,12 +397,7 @@ def run_generator(
     raw = call_claude(GENERATOR_SYSTEM, user_msg)
     print(raw[:600], "…\n" if len(raw) > 600 else "\n")
 
-    try:
-        data = json.loads(raw, strict=False)
-    except json.JSONDecodeError:
-        import re
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        data = json.loads(m.group(), strict=False) if m else {}
+    data = _parse_json_response(raw, agent="generator")
 
     return PortfolioProposal(
         allocations=data.get("allocations", {}),
@@ -436,12 +494,7 @@ def run_evaluator(
     raw = call_claude(EVALUATOR_SYSTEM, user_msg)
     print(raw[:600], "…\n" if len(raw) > 600 else "\n")
 
-    try:
-        data = json.loads(raw, strict=False)
-    except json.JSONDecodeError:
-        import re
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        data = json.loads(m.group(), strict=False) if m else {}
+    data = _parse_json_response(raw, agent="evaluator")
 
     scores = data.get("scores", {})
     avg = sum(scores.values()) / len(scores) if scores else 0
@@ -538,15 +591,10 @@ def run_refiner(
         f"point was addressed."
     )
 
-    raw = call_claude(REFINER_SYSTEM, user_msg)
+    raw = call_claude(REFINER_SYSTEM, user_msg, max_tokens=REFINER_MAX_TOKENS)
     print(raw[:600], "…\n" if len(raw) > 600 else "\n")
 
-    try:
-        data = json.loads(raw, strict=False)
-    except json.JSONDecodeError:
-        import re
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        data = json.loads(m.group(), strict=False) if m else {}
+    data = _parse_json_response(raw, agent="refiner")
 
     return PortfolioProposal(
         allocations=data.get("allocations", {}),
@@ -697,12 +745,7 @@ def run_advisor(final_proposal: PortfolioProposal) -> AdvisorOutput:
     raw = call_claude(ADVISOR_SYSTEM, user_msg)
     print(raw[:500], "…\n" if len(raw) > 500 else "\n")
 
-    try:
-        data = json.loads(raw, strict=False)
-    except json.JSONDecodeError:
-        import re
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        data = json.loads(m.group(), strict=False) if m else {}
+    data = _parse_json_response(raw, agent="advisor")
 
     return AdvisorOutput(
         suggestions=data.get("suggestions", []) or [],
@@ -1191,13 +1234,16 @@ def run_harness(
         }
 
     return {
+        "model": MODEL,
+        "max_iterations": MAX_ITERATIONS,
+        "pass_threshold": PASS_THRESHOLD,
+        "target_max_loss": TARGET_MAX_LOSS,
         "spec": asdict(spec),
         "final_proposal": asdict(final_proposal),
         "final_evaluation": asdict(final_evaluation),
         "selected_iteration": selected_idx,
         "selected_proposal": asdict(selected_proposal),
         "selected_evaluation": asdict(selected_evaluation),
-        "target_max_loss": TARGET_MAX_LOSS,
         "iteration_history": history,
         "refinement": refinement_block,
         "advisor": advisor_block,
@@ -1206,564 +1252,13 @@ def run_harness(
 
 
 # ---------------------------------------------------------------------------
-# Human-readable Markdown report writer
+# Human-readable Markdown report writer — moved to report.py
 # ---------------------------------------------------------------------------
-def _format_value(v: Any) -> str:
-    """Render a JSON-ish value as a readable markdown fragment."""
-    if v is None:
-        return "_(none)_"
-    if isinstance(v, str):
-        return v.strip() or "_(empty)_"
-    if isinstance(v, (list, dict)):
-        return "```json\n" + json.dumps(v, indent=2) + "\n```"
-    return str(v)
+# The writer lives in `report.py` and is imported at the top of this file.
+# It reads everything it needs from the result dict (including model,
+# max_iterations, pass_threshold, target_max_loss) so it has zero
+# dependency on this module's mutable globals.
 
-
-def _format_weight(w: Any) -> str:
-    try:
-        return f"{float(w):.2%}"
-    except (TypeError, ValueError):
-        return str(w)
-
-
-def write_markdown_report(result: dict[str, Any], path: str) -> None:
-    """
-    Write a human-readable Markdown report mirroring the JSON trace.
-    Preserves every structured field; raw model text is tucked into
-    collapsible <details> blocks so the file stays scannable.
-    """
-    spec = result.get("spec") or {}
-    final_p = result.get("final_proposal") or {}
-    final_e = result.get("final_evaluation") or {}
-    history = result.get("iteration_history") or []
-    sel = result.get("selected_iteration")
-    target = result.get("target_max_loss", TARGET_MAX_LOSS)
-    refinement = result.get("refinement") or {}
-    refined_promoted = bool(refinement.get("promoted"))
-
-    out: list[str] = []
-    push = out.append
-
-    # ---- Header ----
-    push("# Portfolio Optimization Harness — Report")
-    push("")
-    push(f"- **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    push(f"- **Model:** `{MODEL}`")
-    push(f"- **Iterations run:** {len(history)} of {MAX_ITERATIONS}")
-    if sel is not None:
-        push(f"- **Selected iteration:** {sel} — best passing portfolio, closest to {target:.1%} target")
-    else:
-        push("- **Selected iteration:** last (no iteration passed QA — see fallback note below)")
-    if refinement.get("performed"):
-        if refined_promoted:
-            push("- **Refinement:** performed — refined portfolio PROMOTED to final")
-        else:
-            push("- **Refinement:** performed — refined version NOT promoted (kept selected as final)")
-    elif refinement.get("skipped_reason"):
-        push(f"- **Refinement:** skipped ({refinement['skipped_reason']})")
-    advisor_hdr = result.get("advisor") or {}
-    if advisor_hdr.get("performed"):
-        n_sugg = len(advisor_hdr.get("suggestions") or [])
-        n_pairs = len(advisor_hdr.get("correlation_pairs") or [])
-        push(
-            f"- **Advisor:** performed — {n_sugg} consolidation "
-            f"suggestion(s), {n_pairs} correlated pair(s) (advisory only)"
-        )
-    elif advisor_hdr.get("skipped_reason"):
-        push(f"- **Advisor:** skipped ({advisor_hdr['skipped_reason']})")
-    pricing_hdr = result.get("pricing") or {}
-    if pricing_hdr.get("performed"):
-        n_failed = len(pricing_hdr.get("failed_tickers") or [])
-        cap_h = pricing_hdr.get("capital", 0.0) or 0.0
-        suffix = f", {n_failed} ticker(s) unpriced" if n_failed else ""
-        push(
-            f"- **Pricing:** performed — yfinance quotes for "
-            f"${cap_h:,.0f} capital lot-size check{suffix}"
-        )
-    elif pricing_hdr.get("skipped_reason"):
-        push(f"- **Pricing:** skipped ({pricing_hdr['skipped_reason']})")
-    push(f"- **Target max loss:** {target:.1%}")
-    push(f"- **Pass threshold:** average score ≥ {PASS_THRESHOLD} with no single score ≤ 4 AND evaluator says passed")
-    push("")
-
-    # ---- Final portfolio ----
-    if refined_promoted:
-        push("## Final Portfolio (refined)")
-    else:
-        push("## Final Portfolio (selected)")
-    push("")
-    allocs = final_p.get("allocations") or {}
-    descs = final_p.get("descriptions") or {}
-    if allocs:
-        if descs:
-            push("| Ticker | Weight | Description |")
-            push("|--------|-------:|-------------|")
-            for ticker, weight in allocs.items():
-                desc = descs.get(ticker, "")
-                push(f"| `{ticker}` | {_format_weight(weight)} | {desc} |")
-        else:
-            push("| Ticker | Weight |")
-            push("|--------|-------:|")
-            for ticker, weight in allocs.items():
-                push(f"| `{ticker}` | {_format_weight(weight)} |")
-        push("")
-    try:
-        er = float(final_p.get("expected_annual_return", 0))
-        dd = float(final_p.get("expected_max_drawdown", 0))
-        push(f"- **Expected annual return:** {er:.2%}")
-        push(f"- **Expected max drawdown:** {dd:.2%}  (target ≤ {target:.1%})")
-    except (TypeError, ValueError):
-        push(f"- **Expected annual return:** {final_p.get('expected_annual_return')}")
-        push(f"- **Expected max drawdown:** {final_p.get('expected_max_drawdown')}")
-    push(f"- **Passed QA:** {final_e.get('passed', False)}")
-    push(f"- **Average QA score:** {final_e.get('average_score', 0)}")
-    push("")
-
-    # ---- Iteration summary ----
-    push("## Iteration Summary")
-    push("")
-    push("| # | Avg Score | Exp. Return | Max Loss | Δ to target | Passed | Selected |")
-    push("|--:|----------:|------------:|---------:|------------:|:------:|:--------:|")
-    for h in history:
-        try:
-            dd_i = float(h.get("expected_max_drawdown", 0))
-            er_i = float(h.get("expected_return", 0))
-        except (TypeError, ValueError):
-            dd_i, er_i = 0.0, 0.0
-        dist = abs(dd_i - target)
-        passed = "YES" if h.get("passed") else "NO"
-        sel_mark = "★" if h.get("selected") else ""
-        push(
-            f"| {h.get('iteration')} | {h.get('average_score', 0):.2f} | "
-            f"{er_i:.2%} | {dd_i:.2%} | {dist:.2%} | {passed} | {sel_mark} |"
-        )
-    push("")
-
-    # ---- Investment spec ----
-    push("## Investment Spec (from Planner)")
-    push("")
-    for key in ("objective", "constraints", "asset_universe", "risk_budget", "evaluation_criteria"):
-        if key in spec and spec[key] not in (None, ""):
-            label = key.replace("_", " ").title()
-            push(f"### {label}")
-            push("")
-            push(_format_value(spec[key]))
-            push("")
-    if spec.get("raw_text"):
-        push("<details><summary>Planner raw response</summary>")
-        push("")
-        push("```")
-        push(spec["raw_text"].rstrip())
-        push("```")
-        push("")
-        push("</details>")
-        push("")
-
-    # ---- Selected portfolio methodology / rationale ----
-    push("## Selected Portfolio — Methodology & Rationale")
-    push("")
-    if final_p.get("methodology"):
-        push("### Methodology")
-        push("")
-        push(_format_value(final_p["methodology"]))
-        push("")
-    if final_p.get("rationale"):
-        push("### Rationale")
-        push("")
-        push(_format_value(final_p["rationale"]))
-        push("")
-    if final_p.get("raw_text"):
-        push("<details><summary>Generator raw response</summary>")
-        push("")
-        push("```")
-        push(final_p["raw_text"].rstrip())
-        push("```")
-        push("")
-        push("</details>")
-        push("")
-
-    # ---- Selected portfolio evaluation ----
-    push("## Selected Portfolio — Evaluator Report")
-    push("")
-    scores = final_e.get("scores") or {}
-    if scores:
-        push("### Scores")
-        push("")
-        push("| Criterion | Score |")
-        push("|-----------|------:|")
-        for k, v in scores.items():
-            push(f"| {k.replace('_', ' ')} | {v} |")
-        push(f"| **Average** | **{final_e.get('average_score', 0)}** |")
-        push("")
-    if final_e.get("critique"):
-        push("### Critique")
-        push("")
-        push(_format_value(final_e["critique"]))
-        push("")
-    if final_e.get("raw_text"):
-        push("<details><summary>Evaluator raw response</summary>")
-        push("")
-        push("```")
-        push(final_e["raw_text"].rstrip())
-        push("```")
-        push("")
-        push("</details>")
-        push("")
-
-    # ---- Post-selection refinement ----
-    if refinement.get("performed"):
-        push("## Post-Selection Refinement")
-        push("")
-        if refined_promoted:
-            push(
-                "The Refiner addressed every critique point above and the "
-                "Evaluator re-scored the result. **The refined portfolio "
-                "passed QA and was promoted to `Final Portfolio` (top of "
-                "this report).** Section below shows the before/after."
-            )
-        else:
-            push(
-                "The Refiner addressed every critique point above, but the "
-                "refined portfolio **did not pass QA on re-evaluation** (or "
-                "exceeded the 5% drawdown target), so the originally "
-                "selected portfolio was kept as the final answer. Section "
-                "below shows what the Refiner produced for comparison."
-            )
-        push("")
-
-        imp = refinement.get("improvements") or {}
-        ref_p = refinement.get("refined_proposal") or {}
-        ref_e = refinement.get("refined_evaluation") or {}
-
-        # Score deltas table
-        score_deltas = imp.get("score_deltas") or {}
-        if score_deltas:
-            push("### Score deltas (Selected → Refined)")
-            push("")
-            push("| Criterion | Selected | Refined | Δ |")
-            push("|-----------|---------:|--------:|--:|")
-            for k, d in score_deltas.items():
-                delta = d.get("delta", 0)
-                sign = "+" if delta > 0 else ""
-                push(
-                    f"| {k.replace('_', ' ')} | {d.get('before', '?')} | "
-                    f"{d.get('after', '?')} | {sign}{delta} |"
-                )
-            avg_b = imp.get("average_score_before", 0)
-            avg_a = imp.get("average_score_after", 0)
-            avg_d = imp.get("average_score_delta", 0)
-            sign = "+" if avg_d > 0 else ""
-            push(f"| **Average** | **{avg_b}** | **{avg_a}** | **{sign}{avg_d}** |")
-            push("")
-
-        # Headline metric deltas
-        push("### Portfolio metric deltas")
-        push("")
-        try:
-            er_b = float(imp.get("expected_return_before", 0))
-            er_a = float(imp.get("expected_return_after", 0))
-            dd_b = float(imp.get("expected_max_drawdown_before", 0))
-            dd_a = float(imp.get("expected_max_drawdown_after", 0))
-            push("| Metric | Selected | Refined | Δ |")
-            push("|--------|---------:|--------:|--:|")
-            push(
-                f"| Expected annual return | {er_b:.2%} | {er_a:.2%} | "
-                f"{'+' if er_a >= er_b else ''}{(er_a - er_b):.2%} |"
-            )
-            push(
-                f"| Expected max drawdown | {dd_b:.2%} | {dd_a:.2%} | "
-                f"{'+' if dd_a >= dd_b else ''}{(dd_a - dd_b):.2%} |"
-            )
-            push(
-                f"| Distance to {target:.0%} target | "
-                f"{abs(dd_b - target):.2%} | {abs(dd_a - target):.2%} | "
-                f"{'+' if abs(dd_a - target) >= abs(dd_b - target) else ''}"
-                f"{(abs(dd_a - target) - abs(dd_b - target)):.2%} |"
-            )
-            push(
-                f"| Passed QA | {imp.get('passed_before')} | "
-                f"{imp.get('passed_after')} | — |"
-            )
-            push("")
-        except (TypeError, ValueError):
-            push("_(Could not compute metric deltas — see raw values below.)_")
-            push("")
-
-        # Allocation changes
-        changes = imp.get("allocation_changes") or []
-        if changes:
-            push("### Allocation changes")
-            push("")
-            push("| Ticker | Selected | Refined | Δ Weight | Kind |")
-            push("|--------|---------:|--------:|---------:|------|")
-            for c in changes:
-                before = float(c.get("before", 0))
-                after = float(c.get("after", 0))
-                delta = float(c.get("delta", 0))
-                sign = "+" if delta > 0 else ""
-                before_s = f"{before:.2%}" if before > 0 else "—"
-                after_s = f"{after:.2%}" if after > 0 else "—"
-                push(
-                    f"| `{c.get('ticker')}` | {before_s} | {after_s} | "
-                    f"{sign}{delta:.2%} | {c.get('kind')} |"
-                )
-            push("")
-
-        # Refined methodology / rationale
-        if ref_p.get("methodology"):
-            push("### Refined methodology")
-            push("")
-            push(_format_value(ref_p["methodology"]))
-            push("")
-        if ref_p.get("rationale"):
-            push("### Refined rationale (point-by-point response to critique)")
-            push("")
-            push(_format_value(ref_p["rationale"]))
-            push("")
-
-        # Refined evaluator report
-        if ref_e.get("scores"):
-            push("### Re-evaluator scores")
-            push("")
-            push("| Criterion | Score |")
-            push("|-----------|------:|")
-            for k, v in ref_e["scores"].items():
-                push(f"| {k.replace('_', ' ')} | {v} |")
-            push(f"| **Average** | **{ref_e.get('average_score', 0)}** |")
-            push(f"| **Passed** | **{ref_e.get('passed', False)}** |")
-            push("")
-        if ref_e.get("critique"):
-            push("### Re-evaluator critique")
-            push("")
-            push(_format_value(ref_e["critique"]))
-            push("")
-
-        if ref_p.get("raw_text") or ref_e.get("raw_text"):
-            push("<details><summary>Refiner & re-evaluator raw responses</summary>")
-            push("")
-            if ref_p.get("raw_text"):
-                push("```")
-                push("--- Refiner raw response ---")
-                push(ref_p["raw_text"].rstrip())
-                push("```")
-                push("")
-            if ref_e.get("raw_text"):
-                push("```")
-                push("--- Re-evaluator raw response ---")
-                push(ref_e["raw_text"].rstrip())
-                push("```")
-                push("")
-            push("</details>")
-            push("")
-
-    # ---- Advisor (simplification suggestions + correlation snapshot) ----
-    advisor = result.get("advisor") or {}
-    if advisor.get("performed"):
-        push("## Simplification Suggestions (advisory — not applied)")
-        push("")
-        push(
-            "The Advisor inspected the **final portfolio** and produced "
-            "the suggestions below.  These are advisory only — the "
-            "portfolio above has NOT been modified.  Decide which (if "
-            "any) to apply yourself."
-        )
-        push("")
-
-        suggestions = advisor.get("suggestions") or []
-        if suggestions:
-            for idx, s in enumerate(suggestions, start=1):
-                merge_from = s.get("merge_from") or []
-                merge_into = s.get("merge_into") or ""
-                from_str = ", ".join(f"`{t}`" for t in merge_from) or "_(none)_"
-                push(f"### Suggestion {idx}: {from_str} → `{merge_into}`")
-                push("")
-                if s.get("rationale"):
-                    push(f"- **Why:** {s['rationale']}")
-                if s.get("tradeoff"):
-                    push(f"- **Tradeoff:** {s['tradeoff']}")
-                push("")
-        else:
-            push("_The Advisor did not propose any consolidations — the "
-                 "portfolio is already well-organised by this measure._")
-            push("")
-
-        pairs = advisor.get("correlation_pairs") or []
-        if pairs:
-            push("### Correlation snapshot")
-            push("")
-            push(
-                "Approximate long-run correlations (model-recalled, not "
-                "computed).  Pairs with |ρ| ≥ 0.5 are shown; sorted by "
-                "strongest first."
-            )
-            push("")
-            push("| Ticker A | Ticker B | ρ | Note |")
-            push("|----------|----------|---:|------|")
-            try:
-                pairs_sorted = sorted(
-                    pairs,
-                    key=lambda p: -abs(float(p.get("rho", 0))),
-                )
-            except (TypeError, ValueError):
-                pairs_sorted = pairs
-            for p in pairs_sorted:
-                try:
-                    rho = float(p.get("rho", 0))
-                    rho_s = f"{rho:+.2f}"
-                except (TypeError, ValueError):
-                    rho_s = str(p.get("rho", ""))
-                push(
-                    f"| `{p.get('a', '')}` | `{p.get('b', '')}` | "
-                    f"{rho_s} | {p.get('note', '') or ''} |"
-                )
-            push("")
-
-        if advisor.get("notes"):
-            push("### Advisor notes")
-            push("")
-            push(_format_value(advisor["notes"]))
-            push("")
-
-        if advisor.get("raw_text"):
-            push("<details><summary>Advisor raw response</summary>")
-            push("")
-            push("```")
-            push(advisor["raw_text"].rstrip())
-            push("```")
-            push("")
-            push("</details>")
-            push("")
-    elif advisor.get("skipped_reason"):
-        push("## Simplification Suggestions (advisory)")
-        push("")
-        push(f"_Advisor pass skipped — {advisor['skipped_reason']}._")
-        push("")
-
-    # ---- Pricing & lot-size feasibility ----
-    pricing = result.get("pricing") or {}
-    if pricing.get("performed"):
-        push("## Latest Prices & Lot-Size Feasibility")
-        push("")
-        if pricing.get("disclaimer"):
-            push(f"> ⚠️ **Data source disclaimer.** {pricing['disclaimer']}")
-            push("")
-
-        cap = float(pricing.get("capital", 0) or 0)
-        total_inv = float(pricing.get("total_invested", 0) or 0)
-        leftover = float(pricing.get("leftover_cash", 0) or 0)
-        max_drift = float(pricing.get("max_abs_drift", 0) or 0)
-        fetched = pricing.get("fetched_at", "")
-        failed_tickers = pricing.get("failed_tickers") or []
-
-        push(f"- **Assumed capital:** ${cap:,.2f}")
-        push(f"- **Total invested (whole shares):** ${total_inv:,.2f}")
-        push(f"- **Leftover cash:** ${leftover:,.2f}")
-        push(f"- **Max |weight drift|:** {max_drift:.2%}")
-        if fetched:
-            push(f"- **Fetched at:** {fetched}")
-        if failed_tickers:
-            ft = ", ".join(f"`{t}`" for t in failed_tickers)
-            push(f"- **Unpriced tickers:** {ft}")
-        push("")
-
-        rows_p = pricing.get("rows") or []
-        if rows_p:
-            push("| Ticker | Price | Target W. | Target $ | Shares | "
-                 "Actual $ | Actual W. | Δ Weight | Status |")
-            push("|--------|------:|----------:|---------:|------:|"
-                 "---------:|----------:|---------:|--------|")
-            for r in rows_p:
-                ticker = r.get("ticker", "")
-                status = r.get("status", "ok")
-                weight = float(r.get("weight", 0) or 0)
-                target_d = float(r.get("target_dollars", 0) or 0)
-                if status == "ok":
-                    price_v = float(r.get("price", 0) or 0)
-                    shares_v = int(r.get("shares", 0) or 0)
-                    actual_d = float(r.get("actual_dollars", 0) or 0)
-                    actual_w = float(r.get("actual_weight", 0) or 0)
-                    drift = float(r.get("weight_drift", 0) or 0)
-                    sign = "+" if drift > 0 else ""
-                    push(
-                        f"| `{ticker}` | ${price_v:,.2f} | "
-                        f"{weight:.2%} | ${target_d:,.2f} | "
-                        f"{shares_v:,d} | ${actual_d:,.2f} | "
-                        f"{actual_w:.2%} | {sign}{drift:.2%} | ok |"
-                    )
-                else:
-                    err = r.get("error") or "unpriced"
-                    push(
-                        f"| `{ticker}` | — | {weight:.2%} | "
-                        f"${target_d:,.2f} | — | — | — | — | {err} |"
-                    )
-            push("")
-    elif pricing.get("skipped_reason"):
-        push("## Latest Prices & Lot-Size Feasibility")
-        push("")
-        push(f"_Pricing pass skipped — {pricing['skipped_reason']}._")
-        push("")
-    elif pricing.get("error"):
-        push("## Latest Prices & Lot-Size Feasibility")
-        push("")
-        push(f"_Pricing pass could not run — {pricing['error']}_")
-        push("")
-
-    # ---- Per-iteration detail ----
-    push("## Iteration History (detailed)")
-    push("")
-    for h in history:
-        sel_mark = " — ★ selected" if h.get("selected") else ""
-        push(f"### Iteration {h.get('iteration')}{sel_mark}")
-        push("")
-        try:
-            dd_i = float(h.get("expected_max_drawdown", 0))
-            er_i = float(h.get("expected_return", 0))
-            push(f"- **Passed:** {h.get('passed')}")
-            push(f"- **Average score:** {h.get('average_score', 0):.2f}")
-            push(f"- **Expected return:** {er_i:.2%}")
-            push(f"- **Expected max drawdown:** {dd_i:.2%}")
-        except (TypeError, ValueError):
-            push(f"- **Passed:** {h.get('passed')}")
-            push(f"- **Average score:** {h.get('average_score')}")
-            push(f"- **Expected return:** {h.get('expected_return')}")
-            push(f"- **Expected max drawdown:** {h.get('expected_max_drawdown')}")
-        push("")
-        scores_i = h.get("scores") or {}
-        if scores_i:
-            push("**Scores:**")
-            push("")
-            push("| Criterion | Score |")
-            push("|-----------|------:|")
-            for k, v in scores_i.items():
-                push(f"| {k.replace('_', ' ')} | {v} |")
-            push("")
-        allocs_i = h.get("allocations") or {}
-        descs_i = h.get("descriptions") or {}
-        if allocs_i:
-            push("**Allocations:**")
-            push("")
-            if descs_i:
-                push("| Ticker | Weight | Description |")
-                push("|--------|-------:|-------------|")
-                for ticker, weight in allocs_i.items():
-                    desc = descs_i.get(ticker, "")
-                    push(f"| `{ticker}` | {_format_weight(weight)} | {desc} |")
-            else:
-                push("| Ticker | Weight |")
-                push("|--------|-------:|")
-                for ticker, weight in allocs_i.items():
-                    push(f"| `{ticker}` | {_format_weight(weight)} |")
-            push("")
-        snip = h.get("critique_snippet")
-        if snip:
-            push("**Critique snippet (first 300 chars):**")
-            push("")
-            for line in snip.splitlines():
-                push(f"> {line}")
-            push("")
-
-    with open(path, "w") as f:
-        f.write("\n".join(out))
 
 
 # ---------------------------------------------------------------------------
