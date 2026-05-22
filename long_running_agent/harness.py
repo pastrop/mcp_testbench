@@ -30,12 +30,19 @@ from typing import Any
 
 import anthropic
 
+from pricing import DEFAULT_CAPITAL, PRICING_DISCLAIMER, run_pricing
 from report import write_markdown_report
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 MODEL = "claude-opus-4-7"
+# Per-agent model overrides.  The Planner is mostly recall + JSON
+# structuring and the Advisor is pattern-matching against training
+# memory — neither needs Opus.  Generator / Evaluator / Refiner do the
+# real reasoning work and stay on MODEL (Opus by default).
+PLANNER_MODEL = "claude-sonnet-4-6"
+ADVISOR_MODEL = "claude-haiku-4-5-20251001"
 MAX_TOKENS = 4096
 # The Refiner emits a full portfolio (allocations + descriptions + numbers)
 # AND a point-by-point response to every critique item — by far the most
@@ -46,16 +53,12 @@ MAX_ITERATIONS = 3          # generator ↔ evaluator rounds
 PASS_THRESHOLD = 7          # minimum average score (out of 10) to pass QA
 TARGET_MAX_LOSS = 0.05      # 5% — the loss budget we want expected_max_drawdown to land on
 UNDER_UTILISATION_BAND = 0.04  # below this we consider the risk budget under-utilised
-
-# --- Pricing / lot-size feasibility ----------------------------------------
-DEFAULT_CAPITAL = 100_000.0  # USD assumed for whole-share lot-size check
-PRICING_DISCLAIMER = (
-    "Prices are fetched from Yahoo Finance via the `yfinance` library and "
-    "reflect the most recent available quote (last close or recent "
-    "intraday). They may differ from real-time market data, and Yahoo's "
-    "unofficial API can occasionally return stale or missing values. "
-    "Do NOT rely on these numbers for trading decisions."
-)
+# Threshold for which Advisor-flagged correlation pairs count as
+# actionable feedback for the next Generator iteration.  The Advisor
+# surfaces pairs at |ρ| ≥ 0.5 for the report, but for prompt feedback
+# we only want the egregious overlaps (≥ 0.7) so the next prompt
+# isn't cluttered with marginal pairs.
+ADVISOR_FEEDBACK_RHO_THRESHOLD = 0.7
 
 # --- Retry / backoff config for transient Anthropic API errors -------------
 # Sequence of attempts and sleeps when an attempt fails with a retryable
@@ -140,36 +143,6 @@ class AdvisorOutput:
     raw_text: str = ""
 
 
-@dataclass
-class TickerPricing:
-    """One row of the pricing / lot-size feasibility table."""
-    ticker: str
-    weight: float                       # target weight from the final proposal
-    status: str = "ok"                  # "ok" | "error"
-    price: float | None = None          # last available quote in USD
-    target_dollars: float = 0.0         # capital * weight
-    shares: int = 0                     # floor(target_dollars / price)
-    actual_dollars: float = 0.0         # shares * price
-    actual_weight: float = 0.0          # actual_dollars / capital
-    weight_drift: float = 0.0           # actual_weight - target weight (signed)
-    error: str | None = None
-
-
-@dataclass
-class PricingResult:
-    """Aggregated pricing + lot-size feasibility report."""
-    capital: float = 0.0
-    total_invested: float = 0.0
-    leftover_cash: float = 0.0
-    max_abs_drift: float = 0.0          # largest |weight_drift| across OK rows
-    rows: list[TickerPricing] = field(default_factory=list)
-    failed_tickers: list[str] = field(default_factory=list)
-    disclaimer: str = ""
-    source: str = "yfinance"
-    fetched_at: str = ""                # ISO timestamp of the fetch
-    error: str | None = None            # set when pricing as a whole could not run
-
-
 # ---------------------------------------------------------------------------
 # Helper: call the Anthropic API
 # ---------------------------------------------------------------------------
@@ -191,6 +164,7 @@ def call_claude(
     system: str,
     user: str,
     *,
+    model: str | None = None,
     max_tokens: int = MAX_TOKENS,
 ) -> str:
     """
@@ -199,25 +173,35 @@ def call_claude(
     blips).  Re-raises immediately on terminal errors (auth, bad request,
     etc.) so we fail fast on real bugs.
 
-    ``max_tokens`` defaults to the module-level ``MAX_TOKENS`` but agents
-    that emit larger outputs (notably the Refiner) can request more so
-    their JSON responses don't truncate mid-string.
+    ``model`` defaults to the module-level ``MODEL`` (resolved at call
+    time so CLI patches still apply) but individual agents can request
+    a cheaper / faster tier — the Planner runs on Sonnet and the Advisor
+    on Haiku by default, since neither needs Opus's reasoning depth.
+
+    ``max_tokens`` defaults to ``MAX_TOKENS`` but agents that emit
+    larger outputs (notably the Refiner) can request more so their JSON
+    responses don't truncate mid-string.
     """
+    # Resolve the model at call time, not at function-definition time —
+    # otherwise the CLI's --model / --test patches to the MODEL global
+    # would be invisible here.
+    effective_model = model if model is not None else MODEL
     for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
         try:
             resp = client.messages.create(
-                model=MODEL,
+                model=effective_model,
                 max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": user}],
             )
             # Surface truncation explicitly — otherwise it presents as
-            # malformed JSON downstream and is hard to diagnose.
+            # malformed JSON downstream and is hard to diagnose.  Include
+            # the model name so mixed-model runs are easier to debug.
             if getattr(resp, "stop_reason", None) == "max_tokens":
                 print(
-                    f"  ⚠️  Response hit max_tokens={max_tokens} — output "
-                    f"likely truncated. Consider raising max_tokens for "
-                    f"this call.",
+                    f"  ⚠️  {effective_model}: response hit "
+                    f"max_tokens={max_tokens} — output likely truncated. "
+                    f"Consider raising max_tokens for this call.",
                     flush=True,
                 )
             return resp.content[0].text
@@ -315,7 +299,7 @@ def run_planner(user_goal: str) -> InvestmentSpec:
     print("PLANNER — expanding user goal into investment spec …")
     print("=" * 60)
 
-    raw = call_claude(PLANNER_SYSTEM, user_goal)
+    raw = call_claude(PLANNER_SYSTEM, user_goal, model=PLANNER_MODEL)
     print(raw[:500], "…\n" if len(raw) > 500 else "\n")
 
     data = _parse_json_response(raw, agent="planner")
@@ -359,6 +343,49 @@ GENERATOR_SYSTEM = textwrap.dedent("""\
     to expected return.  If prior feedback indicated you were well under
     5%, raise the return profile by deploying more risk-bearing exposure
     until your drawdown is near (but under) 5%.
+
+    DIVERSIFICATION — IMPORTANT:
+    The portfolio must be diversified across genuinely independent risk
+    factors, not just across many tickers.  LLMs cannot reliably estimate
+    pairwise correlations from memory, so DO NOT try.  Instead, use this
+    explicit rule:
+
+        From each overlap group below, choose AT MOST ONE ticker.
+
+        US broad equity:           VOO, VTI, SPY, IVV, SPLG, ITOT, SCHB
+        US large-cap factor tilts: QUAL, MTUM, VLUE, USMV, SPHQ, SPLV
+        US dividend tilts:         SCHD, DGRO, VYM, HDV, NOBL, DVY
+        US small-cap:              IWM, VB, IJR, SCHA, VTWO
+        Int'l developed equity:    VEA, IEFA, VXUS, SCHF, IDEV
+        Emerging-market equity:    VWO, IEMG, EEM, SCHE, SPEM
+        Intermediate Treasuries:   IEF, GOVT, VGIT, SCHR
+        Long Treasuries:           TLT, EDV, VGLT, SPTL
+        Short Treasuries / cash:   SHV, SHY, BIL, SGOV, GBIL
+        Investment-grade credit:   LQD, VCIT, VCSH, IGIB, IGSB
+        High-yield credit:         HYG, JNK, USHY, SHYG
+        US aggregate bonds:        AGG, BND, SCHZ, IUSB
+        TIPS / inflation-linked:   TIP, SCHP, VTIP, STIP, LTPZ
+        Municipal bonds:           MUB, VTEB, TFI, SUB
+        Gold:                      GLD, IAU, GLDM, SGOL, BAR
+        Broad commodities:         DBC, PDBC, GSG, BCI, COMT
+        US REITs:                  VNQ, IYR, SCHH, XLRE, RWR
+        Managed futures:           DBMF, KMLM, CTA, WTMF
+
+    Picking VOO + QUAL + SCHD is NOT diversification — all three are
+    ~0.85-0.95 correlated US large-cap equity.  Pick one.  Same for
+    IEF + GOVT, TLT + EDV, LQD + VCIT, GLD + IAU, etc.
+
+    Across groups, also be deliberate: do not combine instruments whose
+    main risk factor is the same in different wrappers (e.g., HYG +
+    high-equity-beta credit is mostly equity risk; LTPZ + EDV is mostly
+    long-duration rate risk).  Spread across genuinely independent
+    factors — equity, duration, credit, inflation-linked, gold,
+    commodities, managed futures.
+
+    If you must pick a ticker not on these lists, do so — but state
+    explicitly in the rationale why it does not overlap with anything
+    already in your allocation.
+
 
     Respond ONLY with a JSON object:
     {
@@ -742,7 +769,7 @@ def run_advisor(final_proposal: PortfolioProposal) -> AdvisorOutput:
         f"changes materially in stress."
     )
 
-    raw = call_claude(ADVISOR_SYSTEM, user_msg)
+    raw = call_claude(ADVISOR_SYSTEM, user_msg, model=ADVISOR_MODEL)
     print(raw[:500], "…\n" if len(raw) > 500 else "\n")
 
     data = _parse_json_response(raw, agent="advisor")
@@ -756,169 +783,72 @@ def run_advisor(final_proposal: PortfolioProposal) -> AdvisorOutput:
 
 
 # ---------------------------------------------------------------------------
-# STEP — PRICING & LOT-SIZE FEASIBILITY (yfinance, no LLM call)
-# ---------------------------------------------------------------------------
-def _fetch_one_price(ticker: str) -> tuple[float | None, str | None]:
-    """
-    Fetch the latest available price for one ticker via yfinance.
-    Returns (price, error_message).  On success: (float, None).
-    On any failure (unknown ticker, network blip, NaN result):
-    (None, "human-readable reason").  Never raises.
-    """
-    try:
-        import yfinance as yf
-    except ImportError as exc:
-        return None, f"yfinance not installed ({exc})"
-    try:
-        t = yf.Ticker(ticker)
-        price: float | None = None
-        # fast_info is the cheap path; supports dict and attribute access
-        # across yfinance versions.
-        try:
-            fi = t.fast_info
-            try:
-                price = fi["last_price"]
-            except (KeyError, TypeError):
-                price = getattr(fi, "last_price", None)
-        except Exception:
-            price = None
-        # NaN guard (yfinance sometimes returns NaN for unknown tickers).
-        if price is not None and isinstance(price, float) and price != price:
-            price = None
-        # Fall back to a 1-day history pull if fast_info gave us nothing.
-        if price is None:
-            try:
-                hist = t.history(period="1d")
-                if not hist.empty:
-                    price = float(hist["Close"].iloc[-1])
-            except Exception:
-                price = None
-        if price is None or price <= 0:
-            return None, "no price returned (ticker may be unrecognised)"
-        return float(price), None
-    except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"
-
-
-def run_pricing(
-    final_proposal: PortfolioProposal,
-    capital: float,
-) -> PricingResult:
-    """
-    Fetch the latest price for each ticker in the final portfolio and
-    compute a whole-share lot-size feasibility check:
-
-        target_$  = capital * weight
-        shares    = floor(target_$ / price)
-        actual_$  = shares * price
-        actual_w  = actual_$ / capital
-        drift     = actual_w - weight
-
-    Failures are per-ticker and never crash the pipeline.  Model-invented
-    pseudo-tickers (e.g. "SPX_PUT_SPREAD") are recorded as failed rows
-    with their target_$ preserved for context.
-    """
-    print("\n" + "=" * 60)
-    print(
-        f"PRICING — fetching latest prices from yfinance "
-        f"(capital=${capital:,.0f}) …"
-    )
-    print("=" * 60)
-
-    # Up-front import check — if yfinance is missing, return a marker
-    # result so the report can render a helpful note instead of a stack trace.
-    try:
-        import yfinance as _yf  # noqa: F401
-        import logging
-        # yfinance is chatty about failed tickers — quiet it down so the
-        # harness log stays readable.  We surface per-ticker errors ourselves.
-        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-    except ImportError as exc:
-        msg = (
-            f"yfinance is not installed ({exc}). Run `uv sync` from the "
-            f"testbench root to install it."
-        )
-        print(f"  ⚠️  {msg}")
-        return PricingResult(
-            capital=capital,
-            disclaimer=PRICING_DISCLAIMER,
-            error=msg,
-            fetched_at=datetime.now().isoformat(timespec="seconds"),
-        )
-
-    rows: list[TickerPricing] = []
-    failed: list[str] = []
-
-    for ticker, weight in final_proposal.allocations.items():
-        w = float(weight)
-        target_dollars = capital * w
-        price, err = _fetch_one_price(ticker)
-        if price is None:
-            print(f"  ✗ {ticker:25s}  {err}")
-            rows.append(TickerPricing(
-                ticker=ticker,
-                weight=w,
-                status="error",
-                target_dollars=round(target_dollars, 2),
-                error=err,
-            ))
-            failed.append(ticker)
-            continue
-        shares = int(target_dollars // price)
-        actual_dollars = shares * price
-        print(
-            f"  ✓ {ticker:25s}  ${price:>10,.2f}   "
-            f"{shares:>6d} sh   ${actual_dollars:>12,.2f}"
-        )
-        rows.append(TickerPricing(
-            ticker=ticker,
-            weight=w,
-            status="ok",
-            price=round(price, 4),
-            target_dollars=round(target_dollars, 2),
-            shares=shares,
-            actual_dollars=round(actual_dollars, 2),
-        ))
-
-    total_invested = sum(r.actual_dollars for r in rows)
-    leftover_cash = capital - total_invested
-    # Fill in actual_weight / weight_drift now that the totals are known.
-    for r in rows:
-        if r.status == "ok" and capital > 0:
-            r.actual_weight = round(r.actual_dollars / capital, 6)
-            r.weight_drift = round(r.actual_weight - r.weight, 6)
-    max_abs_drift = max(
-        (abs(r.weight_drift) for r in rows if r.status == "ok"),
-        default=0.0,
-    )
-
-    print(f"\n  Total invested  : ${total_invested:>12,.2f}")
-    print(f"  Leftover cash   : ${leftover_cash:>12,.2f}")
-    print(f"  Max |Δ weight|  : {max_abs_drift:.2%}")
-    if failed:
-        print(f"  Failed tickers  : {', '.join(failed)}")
-
-    return PricingResult(
-        capital=capital,
-        total_invested=round(total_invested, 2),
-        leftover_cash=round(leftover_cash, 2),
-        max_abs_drift=round(max_abs_drift, 6),
-        rows=rows,
-        failed_tickers=failed,
-        disclaimer=PRICING_DISCLAIMER,
-        source="yfinance",
-        fetched_at=datetime.now().isoformat(timespec="seconds"),
-    )
-
-
-# ---------------------------------------------------------------------------
 # ORCHESTRATOR — the harness loop
 # ---------------------------------------------------------------------------
-def _build_feedback(evaluation: EvaluationResult, proposal: PortfolioProposal) -> str:
+def _format_advisor_feedback(advisor_output: AdvisorOutput | None) -> str:
+    """
+    Format the Advisor's correlation findings as a concrete, actionable
+    block for the next Generator iteration's prompt.  Only pairs whose
+    absolute correlation is ≥ ``ADVISOR_FEEDBACK_RHO_THRESHOLD`` (default
+    0.7) are surfaced — below that we don't want to clutter the prompt
+    with marginal overlaps.
+
+    Returns "" when the Advisor is missing, found nothing actionable,
+    or wasn't run.
+    """
+    if advisor_output is None:
+        return ""
+    pairs = []
+    for p in (advisor_output.correlation_pairs or []):
+        try:
+            rho = float(p.get("rho", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(rho) >= ADVISOR_FEEDBACK_RHO_THRESHOLD:
+            pairs.append((p.get("a", ""), p.get("b", ""), rho))
+    suggestions = advisor_output.suggestions or []
+    if not pairs and not suggestions:
+        return ""
+
+    lines: list[str] = [
+        "ADVISOR FINDINGS — OVERLAPPING HOLDINGS IN YOUR PREVIOUS PORTFOLIO:",
+        "",
+        (
+            f"The previous portfolio contains highly correlated holdings "
+            f"(|ρ| ≥ {ADVISOR_FEEDBACK_RHO_THRESHOLD:.2f}). Each pair "
+            f"represents redundant exposure — collapse each pair into "
+            f"ONE ticker in your next iteration."
+        ),
+        "",
+    ]
+    if pairs:
+        lines.append("Correlated pairs to consolidate:")
+        for a, b, rho in sorted(pairs, key=lambda x: -abs(x[2])):
+            lines.append(f"  • {a} ↔ {b}  (ρ ≈ {rho:+.2f})")
+        lines.append("")
+    if suggestions:
+        lines.append("Specific consolidation suggestions:")
+        for s in suggestions:
+            merge_from = " + ".join(s.get("merge_from") or []) or "(unspecified)"
+            merge_into = s.get("merge_into") or "(unspecified)"
+            tradeoff = s.get("tradeoff") or ""
+            line = f"  • Replace {merge_from} → {merge_into}"
+            if tradeoff:
+                line += f"  (tradeoff: {tradeoff})"
+            lines.append(line)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _build_feedback(
+    evaluation: EvaluationResult,
+    proposal: PortfolioProposal,
+    advisor_output: AdvisorOutput | None = None,
+) -> str:
     """
     Produce the next round's feedback string based on the current evaluation.
 
-    Three regimes:
+    Three regimes (selects the BASE feedback text):
       • Failed QA          → pass the critique through unchanged (today's behaviour).
       • Passed but over 5% → tell the generator to bring drawdown down to ~5%
                               without sacrificing scores.
@@ -927,49 +857,67 @@ def _build_feedback(evaluation: EvaluationResult, proposal: PortfolioProposal) -
                               and to push drawdown closer to (but under) 5%.
       • Passed and near 5% → still ask for a refinement attempt — the selector
                               will keep the best across iterations.
+
+    If ``advisor_output`` is provided, its concrete correlation-pair
+    findings (≥ ``ADVISOR_FEEDBACK_RHO_THRESHOLD``) are prepended to the
+    base feedback.  This converts the Advisor from a one-shot report
+    decoration into a real signal in the generator ↔ evaluator loop —
+    the Generator gets actual overlapping pairs to fix in the next
+    iteration, instead of a vague "avoid correlation" rule it cannot
+    apply (LLMs can't reliably estimate ρ from memory).
     """
     if not evaluation.passed:
-        return evaluation.critique
+        base = evaluation.critique
+    else:
+        dd = proposal.expected_max_drawdown
+        if dd > TARGET_MAX_LOSS:
+            overshoot_pct = (dd - TARGET_MAX_LOSS) * 100
+            base = (
+                f"QA PASSED with average score {evaluation.average_score}, "
+                f"BUT expected_max_drawdown is {dd:.2%}, which exceeds the "
+                f"{TARGET_MAX_LOSS:.0%} loss target by {overshoot_pct:.1f} "
+                f"percentage points. Your top priority this round is to "
+                f"REDUCE expected_max_drawdown as close to {TARGET_MAX_LOSS:.0%} "
+                f"as possible WITHOUT crossing it, while keeping every QA "
+                f"score ≥ {PASS_THRESHOLD}. Accept lower expected return if "
+                f"necessary. Prior critique for reference:\n{evaluation.critique}"
+            )
+        elif dd < UNDER_UTILISATION_BAND:
+            base = (
+                f"QA PASSED with average score {evaluation.average_score} and "
+                f"expected_max_drawdown of {dd:.2%}, which is well UNDER the "
+                f"{TARGET_MAX_LOSS:.0%} loss budget. You are leaving return on "
+                f"the table. This round, deploy more risk-bearing exposure to "
+                f"raise expected_max_drawdown closer to (but still under) "
+                f"{TARGET_MAX_LOSS:.0%}, while keeping every QA score "
+                f"≥ {PASS_THRESHOLD}. Prior critique for reference:\n"
+                f"{evaluation.critique}"
+            )
+        else:
+            base = (
+                f"QA PASSED with average score {evaluation.average_score} and "
+                f"expected_max_drawdown of {dd:.2%}, which is close to the "
+                f"{TARGET_MAX_LOSS:.0%} target. Attempt one more refinement: try "
+                f"to either raise expected_annual_return without exceeding "
+                f"{TARGET_MAX_LOSS:.0%} drawdown, or improve the QA scores while "
+                f"holding drawdown near {TARGET_MAX_LOSS:.0%}. Prior critique:\n"
+                f"{evaluation.critique}"
+            )
 
-    dd = proposal.expected_max_drawdown
-    if dd > TARGET_MAX_LOSS:
-        overshoot_pct = (dd - TARGET_MAX_LOSS) * 100
-        return (
-            f"QA PASSED with average score {evaluation.average_score}, "
-            f"BUT expected_max_drawdown is {dd:.2%}, which exceeds the "
-            f"{TARGET_MAX_LOSS:.0%} loss target by {overshoot_pct:.1f} "
-            f"percentage points. Your top priority this round is to "
-            f"REDUCE expected_max_drawdown as close to {TARGET_MAX_LOSS:.0%} "
-            f"as possible WITHOUT crossing it, while keeping every QA "
-            f"score ≥ {PASS_THRESHOLD}. Accept lower expected return if "
-            f"necessary. Prior critique for reference:\n{evaluation.critique}"
-        )
-    if dd < UNDER_UTILISATION_BAND:
-        return (
-            f"QA PASSED with average score {evaluation.average_score} and "
-            f"expected_max_drawdown of {dd:.2%}, which is well UNDER the "
-            f"{TARGET_MAX_LOSS:.0%} loss budget. You are leaving return on "
-            f"the table. This round, deploy more risk-bearing exposure to "
-            f"raise expected_max_drawdown closer to (but still under) "
-            f"{TARGET_MAX_LOSS:.0%}, while keeping every QA score "
-            f"≥ {PASS_THRESHOLD}. Prior critique for reference:\n"
-            f"{evaluation.critique}"
-        )
-    return (
-        f"QA PASSED with average score {evaluation.average_score} and "
-        f"expected_max_drawdown of {dd:.2%}, which is close to the "
-        f"{TARGET_MAX_LOSS:.0%} target. Attempt one more refinement: try "
-        f"to either raise expected_annual_return without exceeding "
-        f"{TARGET_MAX_LOSS:.0%} drawdown, or improve the QA scores while "
-        f"holding drawdown near {TARGET_MAX_LOSS:.0%}. Prior critique:\n"
-        f"{evaluation.critique}"
-    )
+    advisor_section = _format_advisor_feedback(advisor_output)
+    if advisor_section:
+        return advisor_section + "\n" + base
+    return base
 
 
 def _select_best_iteration(history: list[dict]) -> int | None:
     """
     Return the 1-based iteration index of the best passing iteration, or None
-    if no iteration passed.
+    if no iteration passed.  The orchestrator's no-pass fallback is to keep
+    the FIRST iteration (see ``run_harness``): the critique-driven feedback
+    loop tends to push the generator toward increasingly conservative
+    portfolios (lower returns at similar drawdown), so when nothing passes,
+    the unbiased first attempt is usually the most balanced result.
 
     Selection key (smaller is better):
       1. |expected_max_drawdown - TARGET_MAX_LOSS|   — closeness to the 5% target
@@ -1044,6 +992,29 @@ def run_harness(
         proposals.append(proposal)
         evaluations.append(evaluation)
 
+        # --- Step 3a: Intra-iteration Advisor (feedback signal) ---
+        # Run the Advisor on this iteration's portfolio so the next
+        # round's Generator prompt gets CONCRETE correlation pairs to
+        # collapse, rather than a vague "avoid overlap" rule that the
+        # LLM cannot apply.  Skip on the last iteration (no next round),
+        # when advise is disabled, or when the proposal produced no
+        # allocations.  The final Advisor pass (Step 6) still runs for
+        # the report and may see a different portfolio.
+        # None ⇒ didn't run; int (including 0) ⇒ ran and fed N pairs forward
+        intra_advisor: AdvisorOutput | None = None
+        intra_pairs_count: int | None = None
+        if (
+            advise
+            and i < MAX_ITERATIONS
+            and proposal.allocations
+        ):
+            intra_advisor = run_advisor(proposal)
+            intra_pairs_count = sum(
+                1 for p in (intra_advisor.correlation_pairs or [])
+                if abs(float(p.get("rho", 0) or 0))
+                   >= ADVISOR_FEEDBACK_RHO_THRESHOLD
+            )
+
         history.append({
             "iteration": i,
             "allocations": proposal.allocations,
@@ -1054,6 +1025,7 @@ def run_harness(
             "average_score": evaluation.average_score,
             "passed": evaluation.passed,
             "critique_snippet": evaluation.critique[:300],
+            "intra_advisor_pairs_count": intra_pairs_count,
             "selected": False,
         })
 
@@ -1063,6 +1035,12 @@ def run_harness(
         print(f"  Passed              : {evaluation.passed}")
         print(f"  Expected max loss   : {proposal.expected_max_drawdown:.2%}")
         print(f"  Target max loss     : {TARGET_MAX_LOSS:.0%}")
+        if intra_advisor is not None:
+            print(
+                f"  Advisor (pre-feedback) flagged {intra_pairs_count} "
+                f"pair(s) at |ρ| ≥ {ADVISOR_FEEDBACK_RHO_THRESHOLD:.2f} "
+                f"— feeding into iteration {i + 1}"
+            )
 
         if i == MAX_ITERATIONS:
             # No need to compute feedback after the last round.
@@ -1079,7 +1057,9 @@ def run_harness(
         else:
             print("❌  Failed QA — feeding critique back to generator.\n")
 
-        feedback = _build_feedback(evaluation, proposal)
+        feedback = _build_feedback(
+            evaluation, proposal, advisor_output=intra_advisor,
+        )
 
     # --- Step 4: Select the best passing iteration ---
     selected_idx = _select_best_iteration(history)
@@ -1095,13 +1075,19 @@ def run_harness(
             f"(closest to {TARGET_MAX_LOSS:.0%} target).\n"
         )
     else:
-        # Fall back to the last iteration when nothing passed.
-        history[-1]["selected"] = True
-        selected_proposal = proposals[-1]
-        selected_evaluation = evaluations[-1]
+        # Fall back to the FIRST iteration when nothing passed.  The
+        # critique-driven feedback loop tends to push later iterations
+        # toward increasingly conservative portfolios (lower returns at
+        # similar drawdown).  When no iteration passes QA there is no
+        # "objectively better" one — so we keep the unbiased first
+        # attempt, which is usually the most balanced result.
+        history[0]["selected"] = True
+        selected_proposal = proposals[0]
+        selected_evaluation = evaluations[0]
         print(
             f"\n⚠️  Reached max iterations ({MAX_ITERATIONS}) without any "
-            f"passing portfolio. Returning last iteration.\n"
+            f"passing portfolio. Returning iteration 1 (first attempt — "
+            f"least biased by feedback-driven over-correction).\n"
         )
 
     # --- Step 5: Post-selection Refinement ---
@@ -1226,7 +1212,7 @@ def run_harness(
         pricing_block["skipped_reason"] = "no allocations to price"
         print("\n(Pricing step skipped — no allocations.)\n")
     else:
-        pricing_result = run_pricing(final_proposal, capital)
+        pricing_result = run_pricing(final_proposal.allocations, capital)
         pricing_block = {
             "performed": True,
             "skipped_reason": None,
@@ -1366,7 +1352,10 @@ if __name__ == "__main__":
     price = not args.no_prices
     capital = args.capital
     if args.test:
+        # --test forces ALL agents to haiku (and disables everything else).
         MODEL = _MODEL_ALIASES["haiku"]
+        PLANNER_MODEL = _MODEL_ALIASES["haiku"]
+        ADVISOR_MODEL = _MODEL_ALIASES["haiku"]
         MAX_ITERATIONS = 1
         refine = False   # --test always implies --no-refine
         advise = False   # --test always implies --no-advisor
@@ -1377,8 +1366,21 @@ if __name__ == "__main__":
         )
     else:
         if args.model:
-            MODEL = _MODEL_ALIASES.get(args.model, args.model)
-            print(f"[model override] {MODEL}")
+            # --model X overrides ALL agents to X (escape hatch — runs
+            # the entire pipeline on one tier, useful for cost / quality
+            # comparison or when one tier is overloaded).
+            resolved = _MODEL_ALIASES.get(args.model, args.model)
+            MODEL = resolved
+            PLANNER_MODEL = resolved
+            ADVISOR_MODEL = resolved
+            print(f"[model override — all agents] {MODEL}")
+        else:
+            # No override — show the per-agent assignments so the user
+            # knows the pipeline isn't uniform.
+            print(
+                f"[per-agent models] generator/evaluator/refiner={MODEL}  "
+                f"planner={PLANNER_MODEL}  advisor={ADVISOR_MODEL}"
+            )
         if args.iterations is not None:
             if args.iterations < 1:
                 parser.error("--iterations must be ≥ 1")
