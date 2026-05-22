@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import sys
 import textwrap
 import time
@@ -36,6 +37,11 @@ from report import write_markdown_report
 # ---------------------------------------------------------------------------
 MODEL = "claude-opus-4-7"
 MAX_TOKENS = 4096
+# The Refiner emits a full portfolio (allocations + descriptions + numbers)
+# AND a point-by-point response to every critique item — by far the most
+# output-heavy agent.  4096 tokens regularly truncates mid-string, which
+# previously crashed the JSON parser.  Give it more headroom.
+REFINER_MAX_TOKENS = 8192
 MAX_ITERATIONS = 3          # generator ↔ evaluator rounds
 PASS_THRESHOLD = 7          # minimum average score (out of 10) to pass QA
 TARGET_MAX_LOSS = 0.05      # 5% — the loss budget we want expected_max_drawdown to land on
@@ -181,21 +187,39 @@ def _is_retryable(exc: BaseException) -> bool:
     return False
 
 
-def call_claude(system: str, user: str) -> str:
+def call_claude(
+    system: str,
+    user: str,
+    *,
+    max_tokens: int = MAX_TOKENS,
+) -> str:
     """
     Wrapper around the Messages API with exponential-backoff retry on
     transient errors (529 Overloaded, 429 rate limits, 5xx, connection
     blips).  Re-raises immediately on terminal errors (auth, bad request,
     etc.) so we fail fast on real bugs.
+
+    ``max_tokens`` defaults to the module-level ``MAX_TOKENS`` but agents
+    that emit larger outputs (notably the Refiner) can request more so
+    their JSON responses don't truncate mid-string.
     """
     for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
         try:
             resp = client.messages.create(
                 model=MODEL,
-                max_tokens=MAX_TOKENS,
+                max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": user}],
             )
+            # Surface truncation explicitly — otherwise it presents as
+            # malformed JSON downstream and is hard to diagnose.
+            if getattr(resp, "stop_reason", None) == "max_tokens":
+                print(
+                    f"  ⚠️  Response hit max_tokens={max_tokens} — output "
+                    f"likely truncated. Consider raising max_tokens for "
+                    f"this call.",
+                    flush=True,
+                )
             return resp.content[0].text
         except Exception as exc:
             if attempt == RETRY_MAX_ATTEMPTS or not _is_retryable(exc):
@@ -217,6 +241,49 @@ def call_claude(system: str, user: str) -> str:
     # The loop only exits via return or raise — this is unreachable but
     # satisfies static analysers.
     raise RuntimeError("call_claude retry loop exited unexpectedly")
+
+
+# ---------------------------------------------------------------------------
+# Helper: best-effort JSON parse for model responses
+# ---------------------------------------------------------------------------
+def _parse_json_response(raw: str, *, agent: str = "agent") -> dict[str, Any]:
+    """
+    Parse a model response that's supposed to be JSON.  Two attempts:
+
+      1. Strict ``json.loads`` on the whole string.
+      2. Greedy ``{...}`` regex extract, then ``json.loads`` on that span.
+
+    If BOTH fail (e.g., the response was truncated mid-string by
+    ``max_tokens`` and the regex picks up a partial slice), this function
+    logs a clear diagnostic and returns ``{}`` so the caller can degrade
+    gracefully — the orchestrator already handles empty/missing fields
+    via dataclass defaults.
+
+    The ``agent`` label is only used for the log message.
+    """
+    # Attempt 1: strict parse
+    try:
+        return json.loads(raw, strict=False)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: greedy regex fallback
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(), strict=False)
+        except json.JSONDecodeError:
+            pass
+
+    # Total failure — log and degrade gracefully.
+    print(
+        f"  ⚠️  {agent}: could not parse JSON from response "
+        f"({len(raw):,} chars). Returning empty dict so the pipeline "
+        f"continues. First 300 chars of response follow:\n"
+        f"  {raw[:300]!r}",
+        flush=True,
+    )
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -251,13 +318,7 @@ def run_planner(user_goal: str) -> InvestmentSpec:
     raw = call_claude(PLANNER_SYSTEM, user_goal)
     print(raw[:500], "…\n" if len(raw) > 500 else "\n")
 
-    try:
-        data = json.loads(raw, strict=False)
-    except json.JSONDecodeError:
-        # Model sometimes wraps in markdown fences
-        import re
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        data = json.loads(m.group(), strict=False) if m else {}
+    data = _parse_json_response(raw, agent="planner")
 
     return InvestmentSpec(
         objective=data.get("objective", ""),
@@ -336,12 +397,7 @@ def run_generator(
     raw = call_claude(GENERATOR_SYSTEM, user_msg)
     print(raw[:600], "…\n" if len(raw) > 600 else "\n")
 
-    try:
-        data = json.loads(raw, strict=False)
-    except json.JSONDecodeError:
-        import re
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        data = json.loads(m.group(), strict=False) if m else {}
+    data = _parse_json_response(raw, agent="generator")
 
     return PortfolioProposal(
         allocations=data.get("allocations", {}),
@@ -438,12 +494,7 @@ def run_evaluator(
     raw = call_claude(EVALUATOR_SYSTEM, user_msg)
     print(raw[:600], "…\n" if len(raw) > 600 else "\n")
 
-    try:
-        data = json.loads(raw, strict=False)
-    except json.JSONDecodeError:
-        import re
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        data = json.loads(m.group(), strict=False) if m else {}
+    data = _parse_json_response(raw, agent="evaluator")
 
     scores = data.get("scores", {})
     avg = sum(scores.values()) / len(scores) if scores else 0
@@ -540,15 +591,10 @@ def run_refiner(
         f"point was addressed."
     )
 
-    raw = call_claude(REFINER_SYSTEM, user_msg)
+    raw = call_claude(REFINER_SYSTEM, user_msg, max_tokens=REFINER_MAX_TOKENS)
     print(raw[:600], "…\n" if len(raw) > 600 else "\n")
 
-    try:
-        data = json.loads(raw, strict=False)
-    except json.JSONDecodeError:
-        import re
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        data = json.loads(m.group(), strict=False) if m else {}
+    data = _parse_json_response(raw, agent="refiner")
 
     return PortfolioProposal(
         allocations=data.get("allocations", {}),
@@ -699,12 +745,7 @@ def run_advisor(final_proposal: PortfolioProposal) -> AdvisorOutput:
     raw = call_claude(ADVISOR_SYSTEM, user_msg)
     print(raw[:500], "…\n" if len(raw) > 500 else "\n")
 
-    try:
-        data = json.loads(raw, strict=False)
-    except json.JSONDecodeError:
-        import re
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        data = json.loads(m.group(), strict=False) if m else {}
+    data = _parse_json_response(raw, agent="advisor")
 
     return AdvisorOutput(
         suggestions=data.get("suggestions", []) or [],
