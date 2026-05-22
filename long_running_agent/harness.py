@@ -449,17 +449,41 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
     Grade each criterion on a 1-10 scale.  Be specific about failures.
 
     CRITERIA (graded 1-10):
-    1. CONSTRAINT COMPLIANCE — Does the portfolio truly stay within the
-       ≤5% max annual loss constraint under realistic historical scenarios?
+    1. CONSTRAINT COMPLIANCE — Does the portfolio stay within the ≤5%
+       max annual loss constraint under realistic historical scenarios?
        Check: 2008 GFC, 2020 COVID crash, 2022 rate-hike drawdown.
-       Score ≤ 4 if ANY scenario likely breaches the 5% loss limit.
-       ALSO score ≤ 6 if the expected_max_drawdown is materially BELOW 5%
-       (e.g., under ~4%) without a specific constraint forcing that level
-       of conservatism — under-utilising the 5% risk budget is a flaw,
-       not a virtue, because it sacrifices return for no good reason.
-       A portfolio that lands near (but under) 5% should score highest
-       on this criterion; one that lands far below it should be marked
-       down for wasting risk capacity.
+
+       IMPORTANT — RESPECT THE SPEC'S ENFORCEMENT MECHANISM:
+       If the spec's `constraints` define an `enforcement_mechanism` for
+       the loss cap (e.g., a dynamic de-risking trigger, an options
+       hedge overlay, a rebalancing rule), MODEL that mechanism when
+       computing each scenario's loss.  Apply the trigger logic (or
+       hedge payoff) to the gross drawdown, then judge the
+       POST-mechanism net annual loss against the 5% cap.
+
+       A pre-mechanism gross loss above 5% is acceptable IF the
+       mechanism plausibly contains the post-mechanism annual loss to
+       ≤ 5%.  The spec defined the mechanism; honour it.
+
+       Score ≤ 4 only when either:
+         • The post-mechanism net annual loss STILL breaches 5% in a
+           realistic scenario — i.e., even when the mechanism works
+           as designed, the portfolio would have lost more than 5% in
+           2008 / 2020 / 2022, OR
+         • The mechanism is implausible for the scenario (e.g., a
+           slow drawdown-trigger cannot catch a gap-down event large
+           enough to blow through it in a single session; an options
+           overlay is sized too small to offset the expected loss;
+           the trigger requires liquidity that wouldn't exist in the
+           scenario being modelled).
+
+       ALSO score ≤ 6 if the expected_max_drawdown is materially BELOW
+       5% (e.g., under ~4%) without a specific constraint forcing that
+       level of conservatism — under-utilising the 5% risk budget is a
+       flaw, not a virtue, because it sacrifices return for no good
+       reason.  A portfolio that lands near (but under) 5% should score
+       highest on this criterion; one that lands far below it should
+       be marked down for wasting risk capacity.
 
     2. RETURN POTENTIAL — Is the expected return realistic and competitive
        given the constraints?  Penalise both overestimation and unnecessary
@@ -496,10 +520,37 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
     average score is ≥ 7 — when you found ANY of:
       • A binding hard-constraint violation (FX hedging, ticker cap,
         sector cap, leverage, instrument restrictions, etc.).
-      • A realistic historical scenario that breaches the 5% loss limit.
-      • Material methodology gaps that make the loss estimates unreliable.
+      • A realistic historical scenario where the POST-mechanism annual
+        loss still breaches the 5% cap — i.e., even crediting the
+        spec's enforcement mechanism as designed, the portfolio would
+        have lost more than 5% in 2008 / 2020 / 2022.  A pre-mechanism
+        gross loss above 5% is NOT a fail on its own when the mechanism
+        plausibly contains the post-mechanism loss.
+      • Material methodology gaps that make the loss estimates
+        unreliable (e.g., key scenarios not stress-tested at all,
+        return / risk numbers invented out of thin air, instruments
+        outside the spec's `asset_universe`).
     Your "passed" value will be combined with the numeric pass rule
     (average ≥ 7 AND no single score ≤ 4) — all three must hold to pass.
+
+    CRITIQUE FLAGS RISKS EVEN WHEN PASSING — IMPORTANT:
+    The pass/fail judgement and the critique serve different purposes.
+    Pass on the merits of the spec as written; flag the residual risks
+    of the mechanism the spec relies on SEPARATELY in your critique so
+    the human reader can see them.  Even when you return passed=true,
+    your critique MUST surface the failure modes of the enforcement
+    mechanism, including (when applicable):
+      • Trigger slippage in fast-moving markets
+      • Whipsaw risk — trigger de-risks then misses the rebound
+      • Gap-down risk — a single session that overshoots the trigger
+        threshold before any de-risking can execute
+      • Basis risk in hedge overlays (hedge moves differently than
+        the asset it's meant to protect)
+      • Liquidity / execution risk during a stress event
+      • Reliance on a single mechanism as the sole tail backstop
+    Mention which scenario each risk would matter in.  Do NOT lower the
+    pass judgement on the basis of these risks alone if the mechanism
+    plausibly works as designed — flag them and pass.
 
     No markdown fences — raw JSON only.
 """)
