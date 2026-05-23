@@ -83,7 +83,19 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
     if sel is not None:
         push(f"- **Selected iteration:** {sel} — best passing portfolio, closest to {target:.1%} target")
     else:
-        push("- **Selected iteration:** last (no iteration passed QA — see fallback note below)")
+        # No iteration passed QA. The orchestrator's policy is to keep
+        # the FIRST iteration in that case; derive its index from the
+        # `selected: True` flag in the history list so the report
+        # stays accurate even if the policy changes later.
+        fallback_idx = next(
+            (h.get("iteration") for h in history if h.get("selected")),
+            1,
+        )
+        push(
+            f"- **Selected iteration:** {fallback_idx} (no iteration "
+            f"passed QA — kept first attempt as fallback; later "
+            f"iterations tend to over-correct toward conservative returns)"
+        )
     if refinement.get("performed"):
         if refined_promoted:
             push("- **Refinement:** performed — refined portfolio PROMOTED to final")
@@ -557,6 +569,18 @@ def write_markdown_report(result: dict[str, Any], path: str) -> None:
             push(f"- **Average score:** {h.get('average_score')}")
             push(f"- **Expected return:** {h.get('expected_return')}")
             push(f"- **Expected max drawdown:** {h.get('expected_max_drawdown')}")
+        # Intra-iteration advisor pair count — evidence that the
+        # advisor-in-the-loop feedback signal was active for this round.
+        # Absent in older traces (key won't exist); a count of 0 also
+        # means "nothing actionable was fed forward" — show it either way
+        # so the loop's behavior is visible.
+        intra_n = h.get("intra_advisor_pairs_count")
+        if intra_n is not None:
+            next_iter = (h.get("iteration") or 0) + 1
+            push(
+                f"- **Advisor pairs fed to iteration {next_iter}:** "
+                f"{intra_n}"
+            )
         push("")
         scores_i = h.get("scores") or {}
         if scores_i:

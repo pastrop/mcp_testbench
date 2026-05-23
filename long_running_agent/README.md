@@ -8,41 +8,54 @@ The harness started as the original three-agent pattern (Planner → Generator �
 
 ```
                             ┌──────────┐
-                            │ PLANNER  │
+                            │ PLANNER  │   (Sonnet)
                             └─────┬────┘
                                   │ Investment Spec
                                   ▼
-        ┌─────────────────────────────────────────────┐
-        │  for i in 1..MAX_ITERATIONS (default 3)     │
-        │                                             │
-        │  ┌───────────┐                              │
-        │  │ GENERATOR │ ◀──── critique-driven        │
-        │  └─────┬─────┘       feedback               │
-        │        │ Portfolio                          │
-        │        ▼                                    │
-        │  ┌───────────┐                              │
-        │  │ EVALUATOR │ ── scores + passed flag      │
-        │  └─────┬─────┘                              │
-        │        │                                    │
-        │        ▼                                    │
-        │  history[i] = {alloc, scores, passed, …}    │
-        └─────────────────────────────────────────────┘
+        ┌──────────────────────────────────────────────────────┐
+        │  for i in 1..MAX_ITERATIONS (default 3)              │
+        │                                                      │
+        │  ┌───────────┐                                       │
+        │  │ GENERATOR │ ◀──── critique + advisor pairs        │
+        │  │  (Opus)   │       (concrete tickers to consolidate)│
+        │  └─────┬─────┘                                       │
+        │        │ Portfolio                                   │
+        │        ▼                                             │
+        │  ┌───────────┐                                       │
+        │  │ EVALUATOR │ ── scores + passed flag               │
+        │  │  (Opus)   │                                       │
+        │  └─────┬─────┘                                       │
+        │        │                                             │
+        │        ▼                                             │
+        │  ┌───────────┐                                       │
+        │  │  ADVISOR  │ ── correlation pairs ≥ 0.7            │
+        │  │  (Haiku,  │    (skipped on last iter — no         │
+        │  │  intra)   │     next round to feed)               │
+        │  └─────┬─────┘                                       │
+        │        │                                             │
+        │        ▼                                             │
+        │  history[i] = {alloc, scores, passed, …}             │
+        └──────────────────────────────────────────────────────┘
                                   │
                                   ▼
                           ┌──────────────┐
-                          │   SELECTOR   │   pick passing iteration whose
-                          │ (no LLM call)│   |drawdown − 5%| is smallest
+                          │   SELECTOR   │   best passing iteration
+                          │ (no LLM call)│   (closest |drawdown − 5%|);
+                          │              │   falls back to iter 1 if
+                          │              │   no iteration passed
                           └──────┬───────┘
                                  │ selected_proposal
                                  ▼
                           ┌──────────────┐
                           │   REFINER    │   surgically address every
-                          └──────┬───────┘   critique point
+                          │   (Opus)     │   critique point
+                          └──────┬───────┘
                                  │ refined_proposal
                                  ▼
                           ┌──────────────┐
                           │  EVALUATOR   │   re-score the refined version
-                          │   (re-run)   │
+                          │  (Opus,      │
+                          │   re-run)    │
                           └──────┬───────┘
                                  │
                                  ▼
@@ -57,7 +70,14 @@ The harness started as the original three-agent pattern (Planner → Generator �
                               ▼
                        ┌──────────────┐
                        │   ADVISOR    │   surface correlated holdings +
-                       │ (read-only)  │   structured merge suggestions
+                       │  (Haiku,     │   structured merge suggestions
+                       │  read-only)  │   (for the report)
+                       └──────┬───────┘
+                              │
+                              ▼
+                       ┌──────────────┐
+                       │   PRICING    │   yfinance quotes + whole-share
+                       │ (no LLM)     │   lot-size feasibility check
                        └──────┬───────┘
                               │
                               ▼
@@ -71,21 +91,26 @@ The harness started as the original three-agent pattern (Planner → Generator �
 | **Planner** | Expands a brief user goal ("maximize return, ≤5% annual loss") into a detailed investment specification: asset universe, constraints, risk budget, evaluation criteria, tail-risk scenarios. |
 | **Generator** | Constructs a concrete portfolio allocation that satisfies the spec. Now returns plain-English `descriptions` for each ticker alongside `allocations`. On later iterations, addresses every point from the evaluator's critique. |
 | **Evaluator** | Independently stress-tests the portfolio against five 1–10 criteria (constraint compliance, return potential, diversification, implementability, methodology rigour) and writes a detailed critique. **Passes only if** `avg ≥ 7` AND `no single score ≤ 4` AND the evaluator's own `passed: true/false` judgement agrees — all three must hold. |
-| **Selector** (no LLM call) | After all `MAX_ITERATIONS` rounds finish, picks the passing iteration whose `expected_max_drawdown` is closest to the 5% loss target. Tiebreak: smaller drawdown, then higher score. Falls back to the last iteration if nothing passed. |
+| **Selector** (no LLM call) | After all `MAX_ITERATIONS` rounds finish, picks the passing iteration whose `expected_max_drawdown` is closest to the 5% loss target. Tiebreak: smaller drawdown, then higher score. **Falls back to iteration 1** if no iteration passed — the critique-feedback loop tends to push later iterations toward increasingly conservative portfolios (lower returns at similar drawdown), so when nothing passes, the unbiased first attempt is usually the most balanced. |
 | **Refiner** | Takes the selected portfolio + the evaluator's critique and produces a surgical revision that addresses every flagged issue while preserving what worked. Re-evaluated; **promoted to final only if it passes QA and stays within the 5% drawdown target**, otherwise the selected version is kept. |
-| **Advisor** (read-only) | Inspects the final portfolio and emits a pairwise correlation snapshot plus structured `{merge_from, merge_into, rationale, tradeoff}` consolidation suggestions. **Never modifies the portfolio** — every suggestion has an explicit tradeoff so the human reader can decide whether to apply it. |
+| **Advisor** (read-only) | Plays **two roles**, both read-only with respect to the portfolio. **(1) Per-iteration:** runs after each Generator/Evaluator pair (except the last) and emits correlation pairs at \|ρ\| ≥ 0.7; these pairs are fed into the next round's Generator feedback as concrete tickers to consolidate. **(2) Final pass:** runs once on the final portfolio to produce the report's pairwise correlation snapshot plus structured `{merge_from, merge_into, rationale, tradeoff}` consolidation suggestions — every suggestion has an explicit tradeoff so the human reader can decide whether to apply it. |
+| **Pricing** (no LLM call) | Fetches the latest price for each ticker via [`yfinance`](https://github.com/ranaroussi/yfinance) and computes a whole-share lot-size feasibility check against `--capital` USD (default $100k). Per-ticker failures (unknown ticker, network blip, model-invented pseudo-ticker like `SPX_PUT_SPREAD`) degrade gracefully. Output includes a Yahoo Finance data-source disclaimer. |
 
 ### Key design decisions
 
-1. **Separation of generation and evaluation.** The blog post's central insight: a generator asked to self-evaluate will "confidently praise its own work." The Evaluator is prompted to be tough and is explicitly told to return `passed: false` whenever it finds a binding-constraint violation (FX hedging, ticker cap, leverage, etc.), even if the numeric scores are high.
+1. **Separation of generation and evaluation.** A generator asked to grade its own work will praise it, so the Evaluator is a separate agent with a "skeptical, rigorous" prompt that scores five 1–10 criteria and independently judges pass/fail. The Evaluator honours the spec **as written** — when the Planner defines an `enforcement_mechanism` for the loss cap (e.g., a dynamic de-risking trigger), the Evaluator models that mechanism when stress-testing and judges the post-mechanism loss against the cap, rather than vetoing on the pre-mechanism gross drawdown. Pass/fail and the critique are orthogonal: portfolios that meet the spec's stated criteria pass even when residual mechanism risks (slippage, gap-down, single point of failure) exist, but those risks are still surfaced in the critique for the human reader.
 
 2. **Always run all iterations, then select.** The original harness exited the loop as soon as one iteration passed. That gave away later iterations that could have landed closer to the 5% risk-budget target. Now the loop always runs `MAX_ITERATIONS` rounds; after the loop, the Selector picks the best passing iteration by closeness to the target.
 
-3. **Iteration feedback is regime-aware.** When an iteration passes but its drawdown is over 5% the Generator is told to push it down; when drawdown is well under 5% (≤ `UNDER_UTILISATION_BAND`) the Generator is told the risk budget is being wasted and to deploy more risk-bearing exposure. Failures pass the critique through unchanged.
+3. **Iteration feedback is regime-aware AND structurally informed.** Each round's feedback combines two layers: (a) regime-aware guidance from the Evaluator — when an iteration passes but its drawdown is over 5% the Generator is told to push it down; when drawdown is well under 5% (≤ `UNDER_UTILISATION_BAND`) the Generator is told the risk budget is being wasted; failed iterations pass the critique through verbatim. (b) Concrete correlation pairs from the per-iteration Advisor, filtered to \|ρ\| ≥ `ADVISOR_FEEDBACK_RHO_THRESHOLD` (default 0.7), prepended to the feedback as a "ticker A ↔ ticker B (ρ ≈ 0.95) — collapse" block. Pass and failure paths both get the Advisor section.
 
-4. **Refinement applies; advice does not.** The Refiner is allowed to replace the selected portfolio if its output passes QA. The Advisor never modifies anything — it produces structured suggestions for the human reader. This split keeps "automated improvement" and "human judgement" cleanly separated.
+4. **Refinement applies; advice influences but never overwrites.** The Refiner is the only agent that can replace the selected portfolio's holdings (and only if its output passes QA and stays within the 5% drawdown). The Advisor never edits the portfolio directly — but its per-iteration correlation findings DO feed the next Generator round, converting "avoid correlation" from an unactionable LLM rule into ticker-to-ticker guidance the model can actually follow. The final Advisor pass for the report stays purely read-only.
 
-5. **Resilience to transient API failures.** Each `call_claude` is wrapped in exponential-backoff retry on 429/5xx/529/connection/timeout errors (5 SDK retries + 6 outer attempts with 2/4/8/16/32s jitter, ≈62s max wall-clock). Auth/validation errors fast-fail.
+5. **Per-agent model tier.** Not every agent needs the most capable model. Generator / Evaluator / Refiner stay on Opus (the real reasoning work). Planner runs on Sonnet (recall + JSON structuring — doesn't need Opus). Advisor runs on Haiku (pattern-matching against training memory for known ticker correlations — Haiku is fine and the intra-loop placement makes its speed valuable). Saves ~17% of default-run cost with no observable quality impact on the agents that drive the outcome. `--model X` overrides all three to X — useful when one tier is overloaded or for direct cost/quality comparison.
+
+6. **Evaluator honours the spec as written.** The Planner can define an `enforcement_mechanism` for the loss cap (e.g., a dynamic de-risking trigger, an options hedge overlay). When it does, the Evaluator models that mechanism when stress-testing and judges the **post-mechanism** annual loss against the cap — not the pre-mechanism gross drawdown. Pass/fail and the critique are orthogonal: portfolios that meet the spec's stated criteria pass, but the critique still surfaces residual mechanism risks (slippage, gap-down, single point of failure) so the human reader sees them. Without this, every aggressive portfolio gets vetoed for "breaching" a cap the spec's own mechanism was supposed to enforce.
+
+7. **Resilience to transient API failures.** Each `call_claude` is wrapped in exponential-backoff retry on 429/5xx/529/connection/timeout errors (5 SDK retries + 6 outer attempts with 2/4/8/16/32s jitter, ≈62s max wall-clock). Auth/validation errors fast-fail. Refiner gets `REFINER_MAX_TOKENS = 8192` instead of the default 4096 (it emits both a full portfolio and a per-critique rationale; 4096 was truncating mid-string). All five `run_*` agents share a single fail-soft `_parse_json_response` helper — on unparseable model output, it returns `{}` and the pipeline degrades through dataclass defaults rather than crashing the whole run.
 
 ## Running
 
@@ -107,40 +132,60 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 ### Default run
 
-Opus 4.7, 3 iterations, refinement on, advisor on:
+Per-agent models (Sonnet planner / Opus generator+evaluator+refiner / Haiku advisor), 3 iterations, refinement on, advisor on (both in-loop and final pass), pricing on:
 
 ```bash
 uv run python long_running_agent/harness.py
 ```
 
-This makes ~10 API calls per run (1 planner + 3×generator + 3×evaluator + refiner + re-evaluator + advisor) and takes a few minutes against Opus 4.7.
+This makes ~12 API calls per run:
+
+| Calls | Agent | Model |
+|--:|---|---|
+| 1 | Planner | Sonnet |
+| 3 | Generator (one per iteration) | Opus |
+| 3 | Evaluator (one per iteration) | Opus |
+| 2 | Advisor (intra-loop, skipped on last iter) | Haiku |
+| 1 | Refiner | Opus |
+| 1 | Evaluator (re-run on refined) | Opus |
+| 1 | Advisor (final, for the report) | Haiku |
+
+Plus one yfinance batch (no API key needed; per-ticker failures degrade gracefully). Takes a few minutes against Opus.
 
 ### CLI flags
 
 | Flag | Effect |
 |---|---|
-| `--test` | Smoke-test mode: Haiku 4.5, 1 iteration, no refinement, no advisor. ~3 API calls, cheapest end-to-end verification of the plumbing. Useful when Opus is overloaded or you just want to see the flow run. |
-| `--model {haiku\|sonnet\|opus\|<full-id>}` | Override the model. Aliases resolve to `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, `claude-opus-4-7`. Any other string is passed through verbatim as a model ID. |
+| `--test` | Smoke-test mode: Haiku 4.5 for ALL agents, 1 iteration, no refinement, no advisor, no pricing. ~3 API calls, cheapest end-to-end verification of the plumbing. Useful when Opus is overloaded or you just want to see the flow run. |
+| `--model {haiku\|sonnet\|opus\|<full-id>}` | Override the model **for all agents** (planner / generator / evaluator / refiner / advisor). Aliases resolve to `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, `claude-opus-4-7`. Any other string is passed through verbatim as a model ID. |
 | `--iterations N` | Override `MAX_ITERATIONS` for this run (default 3). |
 | `--no-refine` | Skip the post-selection Refiner pass. |
-| `--no-advisor` | Skip the post-selection Advisor pass. |
+| `--no-advisor` | Skip the Advisor entirely — both the per-iteration feedback role and the final read-only pass for the report. |
+| `--no-prices` | Skip the post-selection Pricing pass (yfinance lookups + lot-size feasibility). Pricing is on by default. |
+| `--capital USD` | Capital assumed for the whole-share lot-size feasibility check (default $100,000). Only used when pricing is enabled. |
 
-`--test` takes precedence — if combined with `--model` / `--iterations` / `--no-refine` / `--no-advisor`, the test-mode defaults win.
+`--test` takes precedence — if combined with `--model` / `--iterations` / `--no-refine` / `--no-advisor` / `--no-prices` / `--capital`, the test-mode defaults win.
 
 ### Examples
 
 ```bash
-# Full default run
+# Full default run (per-agent models, refinement on, advisor in-loop + final, pricing on)
 uv run python long_running_agent/harness.py
 
-# Quick smoke test — Haiku, 1 iteration, no refiner, no advisor
+# Quick smoke test — Haiku for everything, 1 iteration, no refiner/advisor/pricing
 uv run python long_running_agent/harness.py --test
 
-# Opus is overloaded? Full 3-iteration run on Sonnet
+# Opus is overloaded? Full 3-iteration run on Sonnet (overrides per-agent split)
 uv run python long_running_agent/harness.py --model sonnet
 
-# Run with refiner but skip the advisor
+# Run with refiner but skip the advisor entirely (also disables advisor-in-loop feedback)
 uv run python long_running_agent/harness.py --no-advisor
+
+# Skip yfinance price-fetching (e.g., offline or rate-limited)
+uv run python long_running_agent/harness.py --no-prices
+
+# Lot-size feasibility for a $250k portfolio instead of the default $100k
+uv run python long_running_agent/harness.py --capital 250000
 
 # Smallest meaningful real run — Haiku, 2 iterations, with refinement
 uv run python long_running_agent/harness.py --model haiku --iterations 2
@@ -150,17 +195,18 @@ uv run python long_running_agent/harness.py --model haiku --iterations 2
 
 Each run produces two files in the directory it was run from:
 
-- **`harness_output.json`** — machine-readable trace: spec, every iteration's allocations and scores, selected proposal, refinement block (before/after), advisor block (suggestions + correlations), and raw model responses.
+- **`harness_output.json`** — machine-readable trace: run config (`model`, `max_iterations`, `pass_threshold`, `target_max_loss`), spec, every iteration's allocations / scores / intra-advisor pair count, selected proposal, refinement block (before/after), advisor block (suggestions + correlations), pricing block (per-ticker prices + lot sizes + leftover cash), and raw model responses. The trace is **self-describing** — an old `harness_output.json` can be re-rendered through `report.py` without rerunning the pipeline.
 - **`harness_output.md`** — human-readable Markdown report. Renders cleanly in VS Code's built-in preview (`Cmd+Shift+V`) or any Markdown viewer. Contents:
-  - Header summary (model, iterations, selected iteration, refinement / advisor status, target loss, pass rule)
+  - Header summary (model, iterations, selected iteration, refinement / advisor / pricing status, target loss, pass rule)
   - **Final Portfolio** table with `Ticker | Weight | Description` columns
   - Iteration Summary table comparing all iterations on score, return, drawdown, and distance to target — selected iteration starred
   - Investment Spec from the Planner
   - Selected Portfolio Methodology + Rationale
-  - Selected Portfolio Evaluator Scores + Critique
+  - Selected Portfolio Evaluator Scores + Critique (the critique surfaces residual mechanism risks even when the portfolio passed — slippage, gap-down, single point of failure, etc.)
   - **Post-Selection Refinement** section with Score deltas, Portfolio metric deltas, and Allocation changes tables, plus the Refiner's point-by-point rationale and the re-evaluator's report
-  - **Simplification Suggestions** (Advisor) — `{merge_from} → {merge_into}` items with explicit tradeoffs, plus a pairwise correlation table sorted by strongest |ρ|
-  - Per-iteration detail
+  - **Simplification Suggestions** (final Advisor) — `{merge_from} → {merge_into}` items with explicit tradeoffs, plus a pairwise correlation table sorted by strongest |ρ|
+  - **Latest Prices & Lot-Size Feasibility** — per-ticker prices, target $ vs. actual whole-share $, weight drift, leftover cash, plus a Yahoo Finance data-source disclaimer
+  - Per-iteration detail — including `Advisor pairs fed to iteration N` line showing the intra-loop feedback signal
   - Planner / Generator / Evaluator / Refiner / Advisor raw responses in collapsible `<details>` blocks
 
 ## Configuration
@@ -169,12 +215,18 @@ Edit the constants at the top of `harness.py`:
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `MODEL` | `claude-opus-4-7` | Default model (override via `--model`) |
-| `MAX_TOKENS` | `4096` | Per-call token budget |
+| `MODEL` | `claude-opus-4-7` | Default model for Generator / Evaluator / Refiner (override via `--model`, which patches all three per-agent globals) |
+| `PLANNER_MODEL` | `claude-sonnet-4-6` | Model for the Planner (recall + JSON structuring) |
+| `ADVISOR_MODEL` | `claude-haiku-4-5-20251001` | Model for the Advisor (pattern-matching against memory for correlations) |
+| `MAX_TOKENS` | `4096` | Per-call token budget for most agents |
+| `REFINER_MAX_TOKENS` | `8192` | Refiner-only token budget (emits full portfolio + per-critique rationale; 4096 was truncating mid-string) |
 | `MAX_ITERATIONS` | `3` | Generator ↔ evaluator rounds (override via `--iterations`) |
 | `PASS_THRESHOLD` | `7` | Minimum average score for a portfolio to pass |
 | `TARGET_MAX_LOSS` | `0.05` | The 5% loss-budget target the selector aims for |
 | `UNDER_UTILISATION_BAND` | `0.04` | Drawdowns below this are flagged as "wasting risk capacity" in feedback |
+| `ADVISOR_FEEDBACK_RHO_THRESHOLD` | `0.7` | Minimum \|ρ\| for an Advisor-flagged pair to be fed back into the next Generator iteration's prompt (Advisor still flags pairs ≥ 0.5 for the final report) |
+| `DEFAULT_CAPITAL` | `100_000.0` | USD assumed for the whole-share lot-size feasibility check (override via `--capital`) — defined in `pricing.py` |
+| `PRICING_DISCLAIMER` | … | Yahoo Finance data-source caveat shown in the markdown report's pricing section — defined in `pricing.py` |
 | `SDK_MAX_RETRIES` | `5` | SDK-level transparent retries on transient errors |
 | `RETRY_MAX_ATTEMPTS` | `6` | Outer-wrapper attempts on top of SDK |
 | `RETRY_INITIAL_BACKOFF_SECONDS` | `2.0` | First backoff before retry 2 |
@@ -186,9 +238,9 @@ Edit the constants at the top of `harness.py`:
 Some natural next steps:
 
 - **Structured critique.** Have the Evaluator return critique as a list of `{issue, severity, suggested_fix}` objects instead of one prose paragraph. The Refiner could then address each item explicitly and report which were resolved.
-- **Deterministic constraint checker.** Add a Python pre-check that verifies hard rules (ticker count ≤ 15, FX-hedged-only on non-USD, sector caps, leverage) before the LLM evaluator sees the portfolio. Cheap, deterministic, no opinion drift.
-- **Real data.** Plug in `yfinance` or similar to fetch actual historical returns, then have the generator use real numbers and the evaluator run actual backtests.
-- **Tool use.** Give the generator and evaluator Claude tool-use capabilities so they can call Python functions (mean-variance solver, Sharpe ratio, drawdown calc) rather than reasoning from memory.
+- **Deterministic constraint checker.** Add a Python pre-check that verifies hard rules (ticker count ≤ 15, sector caps, leverage, instruments restricted to the spec's `asset_universe`) before the LLM Evaluator sees the portfolio. Cheap, deterministic, no opinion drift. Would also catch the "Generator used a ticker outside the asset_universe" failure mode the Evaluator currently has to spot manually. (The same idea applies to correlation: a small static `|ρ| > 0.6` matrix in Python could enforce the diversification rule deterministically rather than relying on the LLM-as-judge.)
+- **Real historical data for backtests.** `yfinance` is already in the pipeline for spot prices and lot-size feasibility — extend it to pull multi-year price history, then have the Evaluator run actual backtests on 2008 / 2020 / 2022 instead of estimating losses from memory. This would tighten the loss-cap judgement significantly.
+- **Tool use.** Give the Generator and Evaluator Claude tool-use capabilities so they can call Python functions (mean-variance solver, Sharpe ratio, drawdown calc, the correlation lookup above) rather than reasoning from memory.
 - **Sprint decomposition.** For a more complex version, break the work into sprints (asset selection → weight optimisation → tail-risk hedging → final review), each with its own generator ↔ evaluator loop.
 
 ## Disclaimer
