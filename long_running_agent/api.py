@@ -54,6 +54,11 @@ MAX_TOKENS = 4096
 # output-heavy agent.  4096 tokens regularly truncates mid-string, which
 # previously crashed the JSON parser.  Give it more headroom.
 REFINER_MAX_TOKENS = 8192
+# The Planner's spec is detailed (objective, constraints, asset_universe,
+# risk_budget, evaluation_criteria) and now incorporates web_search
+# findings.  Web search also induces some narration overhead before the
+# final JSON.  4096 truncates regularly; bump to match Refiner's headroom.
+PLANNER_MAX_TOKENS = 8192
 
 
 # ---------------------------------------------------------------------------
@@ -363,26 +368,46 @@ def call_claude(
 # ---------------------------------------------------------------------------
 def _parse_json_response(raw: str, *, agent: str = "agent") -> dict[str, Any]:
     """
-    Parse a model response that's supposed to be JSON.  Two attempts:
+    Parse a model response that's supposed to be JSON.  Three attempts,
+    in order of preference:
 
       1. Strict ``json.loads`` on the whole string.
-      2. Greedy ``{...}`` regex extract, then ``json.loads`` on that span.
+      2. Markdown-fenced block: extract the JSON between ``​```json``
+         (or bare ``​```) fences, then strict parse.  Catches the common
+         case where the model wraps JSON in a code block, often with a
+         prose preamble before it — the greedy regex (attempt 3) would
+         over-grab in that case and include the closing fence.
+      3. Greedy ``{...}`` regex extract, then strict parse.  Last-ditch
+         fallback for unfenced JSON with surrounding prose.
 
-    If BOTH fail (e.g., the response was truncated mid-string by
-    ``max_tokens`` and the regex picks up a partial slice), this function
+    If ALL THREE fail (e.g., the response was truncated mid-string by
+    ``max_tokens`` and every extracted span is incomplete), this function
     logs a clear diagnostic and returns ``{}`` so the caller can degrade
     gracefully — the orchestrator already handles empty/missing fields
     via dataclass defaults.
 
     The ``agent`` label is only used for the log message.
     """
-    # Attempt 1: strict parse
+    # Attempt 1: strict parse on the whole response
     try:
         return json.loads(raw, strict=False)
     except json.JSONDecodeError:
         pass
 
-    # Attempt 2: greedy regex fallback
+    # Attempt 2: ```json fenced block (handles preamble + fences cleanly).
+    # ``` may or may not carry a "json" language tag; we accept both.
+    fence_match = re.search(
+        r"```(?:json)?\s*(\{.*?\})\s*```",
+        raw,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1), strict=False)
+        except json.JSONDecodeError:
+            pass
+
+    # Attempt 3: greedy {...} (existing fallback)
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if m:
         try:
