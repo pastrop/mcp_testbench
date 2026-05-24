@@ -1,54 +1,54 @@
 """
-Portfolio Optimization Harness
-==============================
-A three-agent architecture (Planner → Generator → Evaluator) inspired by
-Anthropic's "Harness design for long-running application development" blog post.
+Portfolio Optimization Harness — orchestrator + CLI
+====================================================
+A multi-agent harness inspired by Anthropic's "Harness design for
+long-running application development" blog post, applied to financial
+portfolio optimisation.
 
-The key ideas carried over:
-1. PLANNER  – Expands a brief user goal into a detailed investment spec.
-2. GENERATOR – Builds and optimises the portfolio to meet the spec.
-3. EVALUATOR – Independently stress-tests the portfolio and grades it
-               against hard criteria.  If it fails, feedback loops back
-               to the generator for another iteration.
+Composition (Planner → (Generator ↔ Evaluator + intra-Advisor) × N →
+Selector → Refiner → Re-evaluate → Final Advisor → Pricing) lives in
+this file.  The five LLM agents themselves are in ``agents.py``; the
+Anthropic client wrapper and JSON parser are in ``api.py``; the
+dataclasses passed between agents are in ``models.py``; the markdown
+report writer is in ``report.py``; the yfinance-backed lot-size step
+is in ``pricing.py``.
 
-This is a *concept exploration* — it uses synthetic / freely available data
-so you can run it without paid data feeds.
+This is a *concept exploration* — most data is model-recalled, not
+computed from market feeds (except for the Pricing step's yfinance
+spot-price lookup).
 """
 
 from __future__ import annotations
 
 import json
-import os
-import random
-import re
-import sys
 import textwrap
-import time
-from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from dataclasses import asdict
 from typing import Any
 
-import anthropic
-
+import api
+from agents import (
+    run_advisor,
+    run_evaluator,
+    run_generator,
+    run_planner,
+    run_refiner,
+)
+from models import (
+    AdvisorOutput,
+    EvaluationResult,
+    InvestmentSpec,
+    PortfolioProposal,
+)
 from pricing import DEFAULT_CAPITAL, PRICING_DISCLAIMER, run_pricing
 from report import write_markdown_report
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Orchestrator-only policy constants
 # ---------------------------------------------------------------------------
-MODEL = "claude-opus-4-7"
-# Per-agent model overrides.  The Planner is mostly recall + JSON
-# structuring and the Advisor is pattern-matching against training
-# memory — neither needs Opus.  Generator / Evaluator / Refiner do the
-# real reasoning work and stay on MODEL (Opus by default).
-PLANNER_MODEL = "claude-sonnet-4-6"
-ADVISOR_MODEL = "claude-haiku-4-5-20251001"
-MAX_TOKENS = 4096
-# The Refiner emits a full portfolio (allocations + descriptions + numbers)
-# AND a point-by-point response to every critique item — by far the most
-# output-heavy agent.  4096 tokens regularly truncates mid-string, which
-# previously crashed the JSON parser.  Give it more headroom.
-REFINER_MAX_TOKENS = 8192
+# (Model / token / retry config lives in api.py; per-agent model selection
+# is api.MODEL / api.PLANNER_MODEL / api.ADVISOR_MODEL.  The CLI block at
+# the bottom of this file patches those module-level globals when --test
+# or --model X is provided.)
 MAX_ITERATIONS = 3          # generator ↔ evaluator rounds
 PASS_THRESHOLD = 7          # minimum average score (out of 10) to pass QA
 TARGET_MAX_LOSS = 0.05      # 5% — the loss budget we want expected_max_drawdown to land on
@@ -59,630 +59,6 @@ UNDER_UTILISATION_BAND = 0.04  # below this we consider the risk budget under-ut
 # we only want the egregious overlaps (≥ 0.7) so the next prompt
 # isn't cluttered with marginal pairs.
 ADVISOR_FEEDBACK_RHO_THRESHOLD = 0.7
-
-# --- Retry / backoff config for transient Anthropic API errors -------------
-# Sequence of attempts and sleeps when an attempt fails with a retryable
-# error (529 Overloaded, 429 rate limit, 5xx, connection / timeout errors):
-#
-#   attempt 1  →  sleep   2s (±25% jitter) →
-#   attempt 2  →  sleep   4s  →
-#   attempt 3  →  sleep   8s  →
-#   attempt 4  →  sleep  16s  →
-#   attempt 5  →  sleep  32s  →
-#   attempt 6  →  give up and re-raise
-#
-# Max wall-clock spent on retries before giving up ≈ 62s (+ jitter).
-SDK_MAX_RETRIES = 5                              # SDK-level retries (fast transient blips)
-RETRY_MAX_ATTEMPTS = 6                           # outer wrapper attempts on top of SDK
-RETRY_INITIAL_BACKOFF_SECONDS = 2.0
-RETRY_MAX_BACKOFF_SECONDS = 32.0
-RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504, 529}
-
-if not os.environ.get("ANTHROPIC_API_KEY"):
-    sys.exit(
-        "ERROR: ANTHROPIC_API_KEY environment variable is not set. "
-        "Export it (e.g. `export ANTHROPIC_API_KEY=sk-ant-...`) and try again."
-    )
-
-# Bump SDK retries above the default of 2.  The SDK handles fast transient
-# blips silently; our outer wrapper (in call_claude) handles longer overload
-# events with visible progress logs.
-client = anthropic.Anthropic(max_retries=SDK_MAX_RETRIES)
-
-
-# ---------------------------------------------------------------------------
-# Data classes for structured hand-off between agents
-# ---------------------------------------------------------------------------
-@dataclass
-class InvestmentSpec:
-    """Produced by the Planner.  Consumed by Generator & Evaluator."""
-    objective: str = ""
-    constraints: str = ""
-    asset_universe: str = ""
-    risk_budget: str = ""
-    evaluation_criteria: str = ""
-    raw_text: str = ""
-
-
-@dataclass
-class PortfolioProposal:
-    """Produced by the Generator.  Consumed by the Evaluator."""
-    allocations: dict[str, float] = field(default_factory=dict)
-    descriptions: dict[str, str] = field(default_factory=dict)
-    expected_annual_return: float = 0.0
-    expected_max_drawdown: float = 0.0
-    methodology: str = ""
-    rationale: str = ""
-    raw_text: str = ""
-
-
-@dataclass
-class EvaluationResult:
-    """Produced by the Evaluator.  Fed back to Generator on failure."""
-    passed: bool = False
-    scores: dict[str, float] = field(default_factory=dict)
-    average_score: float = 0.0
-    critique: str = ""
-    raw_text: str = ""
-
-
-@dataclass
-class AdvisorOutput:
-    """
-    Produced by the Advisor.  Pure advisory — never changes the portfolio.
-    Surfaces highly correlated holdings in the FINAL portfolio and offers
-    concrete consolidation ideas with explicit trade-offs.
-    """
-    # List of {"merge_from": [tickers], "merge_into": ticker,
-    #          "rationale": str, "tradeoff": str}
-    suggestions: list[dict[str, Any]] = field(default_factory=list)
-    # List of {"a": ticker_a, "b": ticker_b, "rho": float,
-    #          "note": optional str}
-    correlation_pairs: list[dict[str, Any]] = field(default_factory=list)
-    notes: str = ""
-    raw_text: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Helper: call the Anthropic API
-# ---------------------------------------------------------------------------
-def _is_retryable(exc: BaseException) -> bool:
-    """
-    Return True for transient Anthropic API errors worth retrying:
-      • 429 Rate-limit, 5xx, 529 Overloaded — server-side back-pressure.
-      • Connection / timeout errors — network blips.
-    Auth, validation, and other 4xx errors are NOT retried.
-    """
-    if isinstance(exc, (anthropic.APIConnectionError, anthropic.APITimeoutError)):
-        return True
-    if isinstance(exc, anthropic.APIStatusError):
-        return getattr(exc, "status_code", None) in RETRYABLE_HTTP_STATUS
-    return False
-
-
-def call_claude(
-    system: str,
-    user: str,
-    *,
-    model: str | None = None,
-    max_tokens: int = MAX_TOKENS,
-) -> str:
-    """
-    Wrapper around the Messages API with exponential-backoff retry on
-    transient errors (529 Overloaded, 429 rate limits, 5xx, connection
-    blips).  Re-raises immediately on terminal errors (auth, bad request,
-    etc.) so we fail fast on real bugs.
-
-    ``model`` defaults to the module-level ``MODEL`` (resolved at call
-    time so CLI patches still apply) but individual agents can request
-    a cheaper / faster tier — the Planner runs on Sonnet and the Advisor
-    on Haiku by default, since neither needs Opus's reasoning depth.
-
-    ``max_tokens`` defaults to ``MAX_TOKENS`` but agents that emit
-    larger outputs (notably the Refiner) can request more so their JSON
-    responses don't truncate mid-string.
-    """
-    # Resolve the model at call time, not at function-definition time —
-    # otherwise the CLI's --model / --test patches to the MODEL global
-    # would be invisible here.
-    effective_model = model if model is not None else MODEL
-    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
-        try:
-            resp = client.messages.create(
-                model=effective_model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            # Surface truncation explicitly — otherwise it presents as
-            # malformed JSON downstream and is hard to diagnose.  Include
-            # the model name so mixed-model runs are easier to debug.
-            if getattr(resp, "stop_reason", None) == "max_tokens":
-                print(
-                    f"  ⚠️  {effective_model}: response hit "
-                    f"max_tokens={max_tokens} — output likely truncated. "
-                    f"Consider raising max_tokens for this call.",
-                    flush=True,
-                )
-            return resp.content[0].text
-        except Exception as exc:
-            if attempt == RETRY_MAX_ATTEMPTS or not _is_retryable(exc):
-                raise
-            backoff = min(
-                RETRY_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1)),
-                RETRY_MAX_BACKOFF_SECONDS,
-            )
-            backoff *= 1 + random.random() * 0.25  # +0–25% jitter
-            kind = type(exc).__name__
-            status = getattr(exc, "status_code", None)
-            status_suffix = f" (HTTP {status})" if status else ""
-            print(
-                f"  ⚠️  Anthropic API {kind}{status_suffix} on attempt "
-                f"{attempt}/{RETRY_MAX_ATTEMPTS} — retrying in {backoff:.1f}s",
-                flush=True,
-            )
-            time.sleep(backoff)
-    # The loop only exits via return or raise — this is unreachable but
-    # satisfies static analysers.
-    raise RuntimeError("call_claude retry loop exited unexpectedly")
-
-
-# ---------------------------------------------------------------------------
-# Helper: best-effort JSON parse for model responses
-# ---------------------------------------------------------------------------
-def _parse_json_response(raw: str, *, agent: str = "agent") -> dict[str, Any]:
-    """
-    Parse a model response that's supposed to be JSON.  Two attempts:
-
-      1. Strict ``json.loads`` on the whole string.
-      2. Greedy ``{...}`` regex extract, then ``json.loads`` on that span.
-
-    If BOTH fail (e.g., the response was truncated mid-string by
-    ``max_tokens`` and the regex picks up a partial slice), this function
-    logs a clear diagnostic and returns ``{}`` so the caller can degrade
-    gracefully — the orchestrator already handles empty/missing fields
-    via dataclass defaults.
-
-    The ``agent`` label is only used for the log message.
-    """
-    # Attempt 1: strict parse
-    try:
-        return json.loads(raw, strict=False)
-    except json.JSONDecodeError:
-        pass
-
-    # Attempt 2: greedy regex fallback
-    m = re.search(r"\{.*\}", raw, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(), strict=False)
-        except json.JSONDecodeError:
-            pass
-
-    # Total failure — log and degrade gracefully.
-    print(
-        f"  ⚠️  {agent}: could not parse JSON from response "
-        f"({len(raw):,} chars). Returning empty dict so the pipeline "
-        f"continues. First 300 chars of response follow:\n"
-        f"  {raw[:300]!r}",
-        flush=True,
-    )
-    return {}
-
-
-# ---------------------------------------------------------------------------
-# AGENT 1 — PLANNER
-# ---------------------------------------------------------------------------
-PLANNER_SYSTEM = textwrap.dedent("""\
-    You are an expert investment planner.  Your job is to take a brief,
-    high-level investment goal and expand it into a detailed, actionable
-    investment specification that a portfolio construction engine can execute.
-
-    Be ambitious but realistic.  Think about:
-    • Which asset classes and specific instruments are available to a US retail
-      investor (stocks, ETFs, bonds, REITs, commodities, options overlays, etc.)
-    • Concrete risk constraints (max drawdown, volatility targets, correlation
-      limits, concentration limits)
-    • Benchmark and evaluation criteria (how will we know the portfolio is good?)
-    • Time horizon assumptions and rebalancing cadence
-    • Tail-risk scenarios the portfolio must survive
-
-    Respond ONLY with a JSON object with these keys:
-      objective, constraints, asset_universe, risk_budget, evaluation_criteria
-
-    No markdown fences — raw JSON only.
-""")
-
-
-def run_planner(user_goal: str) -> InvestmentSpec:
-    print("\n" + "=" * 60)
-    print("PLANNER — expanding user goal into investment spec …")
-    print("=" * 60)
-
-    raw = call_claude(PLANNER_SYSTEM, user_goal, model=PLANNER_MODEL)
-    print(raw[:500], "…\n" if len(raw) > 500 else "\n")
-
-    data = _parse_json_response(raw, agent="planner")
-
-    return InvestmentSpec(
-        objective=data.get("objective", ""),
-        constraints=data.get("constraints", ""),
-        asset_universe=data.get("asset_universe", ""),
-        risk_budget=data.get("risk_budget", ""),
-        evaluation_criteria=data.get("evaluation_criteria", ""),
-        raw_text=raw,
-    )
-
-
-# ---------------------------------------------------------------------------
-# AGENT 2 — GENERATOR
-# ---------------------------------------------------------------------------
-GENERATOR_SYSTEM = textwrap.dedent("""\
-    You are an expert quantitative portfolio constructor.
-    You receive a detailed investment specification and (optionally) feedback
-    from a previous QA round.  Your job is to produce a concrete portfolio
-    allocation that meets ALL constraints.
-
-    Think step-by-step:
-    1. Reason about which instruments best satisfy the objective under the
-       constraints.
-    2. Use a mental model of mean-variance optimisation with a drawdown
-       overlay.  Reference realistic historical statistics (you may
-       approximate from memory — this is an exploration, not live trading).
-    3. Stress-test your own proposal against the tail-risk scenarios in the
-       spec BEFORE submitting.
-    4. If you received evaluator feedback, address every point raised.
-
-    RISK BUDGET DISCIPLINE — IMPORTANT:
-    Treat the 5% max annual loss as a budget to be USED, not avoided.
-    A portfolio with a 2% expected_max_drawdown is wasting risk capacity
-    and almost certainly leaving return on the table.  Aim your
-    expected_max_drawdown as close to 5% as you honestly can WITHOUT
-    crossing it.  If prior feedback indicated you were over 5%, your top
-    priority this round is bringing the drawdown down — even at some cost
-    to expected return.  If prior feedback indicated you were well under
-    5%, raise the return profile by deploying more risk-bearing exposure
-    until your drawdown is near (but under) 5%.
-
-    DIVERSIFICATION — IMPORTANT:
-    The portfolio must be diversified across genuinely independent risk
-    factors, not just across many tickers.  LLMs cannot reliably estimate
-    pairwise correlations from memory, so DO NOT try.  Instead, use this
-    explicit rule:
-
-        From each overlap group below, choose AT MOST ONE ticker.
-
-        US broad equity:           VOO, VTI, SPY, IVV, SPLG, ITOT, SCHB
-        US large-cap factor tilts: QUAL, MTUM, VLUE, USMV, SPHQ, SPLV
-        US dividend tilts:         SCHD, DGRO, VYM, HDV, NOBL, DVY
-        US small-cap:              IWM, VB, IJR, SCHA, VTWO
-        Int'l developed equity:    VEA, IEFA, VXUS, SCHF, IDEV
-        Emerging-market equity:    VWO, IEMG, EEM, SCHE, SPEM
-        Intermediate Treasuries:   IEF, GOVT, VGIT, SCHR
-        Long Treasuries:           TLT, EDV, VGLT, SPTL
-        Short Treasuries / cash:   SHV, SHY, BIL, SGOV, GBIL
-        Investment-grade credit:   LQD, VCIT, VCSH, IGIB, IGSB
-        High-yield credit:         HYG, JNK, USHY, SHYG
-        US aggregate bonds:        AGG, BND, SCHZ, IUSB
-        TIPS / inflation-linked:   TIP, SCHP, VTIP, STIP, LTPZ
-        Municipal bonds:           MUB, VTEB, TFI, SUB
-        Gold:                      GLD, IAU, GLDM, SGOL, BAR
-        Broad commodities:         DBC, PDBC, GSG, BCI, COMT
-        US REITs:                  VNQ, IYR, SCHH, XLRE, RWR
-        Managed futures:           DBMF, KMLM, CTA, WTMF
-
-    Picking VOO + QUAL + SCHD is NOT diversification — all three are
-    ~0.85-0.95 correlated US large-cap equity.  Pick one.  Same for
-    IEF + GOVT, TLT + EDV, LQD + VCIT, GLD + IAU, etc.
-
-    Across groups, also be deliberate: do not combine instruments whose
-    main risk factor is the same in different wrappers (e.g., HYG +
-    high-equity-beta credit is mostly equity risk; LTPZ + EDV is mostly
-    long-duration rate risk).  Spread across genuinely independent
-    factors — equity, duration, credit, inflation-linked, gold,
-    commodities, managed futures.
-
-    If you must pick a ticker not on these lists, do so — but state
-    explicitly in the rationale why it does not overlap with anything
-    already in your allocation.
-
-
-    Respond ONLY with a JSON object:
-    {
-      "allocations": {"TICKER_OR_ASSET": weight, ...},
-      "descriptions": {"TICKER_OR_ASSET": "one-line plain-English description", ...},
-      "expected_annual_return": float,
-      "expected_max_drawdown": float,
-      "methodology": "string",
-      "rationale": "string"
-    }
-
-    The "descriptions" map must contain one entry for EVERY ticker in
-    "allocations".  Each description should be a single concise sentence
-    (≤ 15 words) that tells a non-expert what the instrument is, e.g.:
-      "VOO": "Vanguard S&P 500 ETF — tracks the 500 largest US companies",
-      "TLT": "iShares 20+ Year Treasury ETF — long-duration US government bonds",
-      "SPX_PUT_SPREAD": "Protective put spread on the S&P 500 index — tail-risk hedge"
-    Weights must sum to 1.0.  No markdown fences — raw JSON only.
-""")
-
-
-def run_generator(
-    spec: InvestmentSpec,
-    feedback: str | None = None,
-    iteration: int = 1,
-) -> PortfolioProposal:
-    print("\n" + "=" * 60)
-    print(f"GENERATOR — building portfolio (iteration {iteration}) …")
-    print("=" * 60)
-
-    user_msg = f"INVESTMENT SPEC:\n{spec.raw_text}\n"
-    if feedback:
-        user_msg += f"\nEVALUATOR FEEDBACK FROM PREVIOUS ROUND:\n{feedback}\n"
-        user_msg += "\nAddress every issue raised.  Revise the portfolio accordingly."
-
-    raw = call_claude(GENERATOR_SYSTEM, user_msg)
-    print(raw[:600], "…\n" if len(raw) > 600 else "\n")
-
-    data = _parse_json_response(raw, agent="generator")
-
-    return PortfolioProposal(
-        allocations=data.get("allocations", {}),
-        descriptions=data.get("descriptions", {}),
-        expected_annual_return=data.get("expected_annual_return", 0),
-        expected_max_drawdown=data.get("expected_max_drawdown", 0),
-        methodology=data.get("methodology", ""),
-        rationale=data.get("rationale", ""),
-        raw_text=raw,
-    )
-
-
-# ---------------------------------------------------------------------------
-# AGENT 3 — EVALUATOR
-# ---------------------------------------------------------------------------
-EVALUATOR_SYSTEM = textwrap.dedent("""\
-    You are a skeptical, rigorous portfolio risk analyst — the QA agent.
-    Your job is to independently evaluate a proposed portfolio against an
-    investment specification.  You must be TOUGH.  Do NOT give the benefit
-    of the doubt.
-
-    Grade each criterion on a 1-10 scale.  Be specific about failures.
-
-    CRITERIA (graded 1-10):
-    1. CONSTRAINT COMPLIANCE — Does the portfolio stay within the ≤5%
-       max annual loss constraint under realistic historical scenarios?
-       Check: 2008 GFC, 2020 COVID crash, 2022 rate-hike drawdown.
-
-       IMPORTANT — RESPECT THE SPEC'S ENFORCEMENT MECHANISM:
-       If the spec's `constraints` define an `enforcement_mechanism` for
-       the loss cap (e.g., a dynamic de-risking trigger, an options
-       hedge overlay, a rebalancing rule), MODEL that mechanism when
-       computing each scenario's loss.  Apply the trigger logic (or
-       hedge payoff) to the gross drawdown, then judge the
-       POST-mechanism net annual loss against the 5% cap.
-
-       A pre-mechanism gross loss above 5% is acceptable IF the
-       mechanism plausibly contains the post-mechanism annual loss to
-       ≤ 5%.  The spec defined the mechanism; honour it.
-
-       Score ≤ 4 only when either:
-         • The post-mechanism net annual loss STILL breaches 5% in a
-           realistic scenario — i.e., even when the mechanism works
-           as designed, the portfolio would have lost more than 5% in
-           2008 / 2020 / 2022, OR
-         • The mechanism is implausible for the scenario (e.g., a
-           slow drawdown-trigger cannot catch a gap-down event large
-           enough to blow through it in a single session; an options
-           overlay is sized too small to offset the expected loss;
-           the trigger requires liquidity that wouldn't exist in the
-           scenario being modelled).
-
-       ALSO score ≤ 6 if the expected_max_drawdown is materially BELOW
-       5% (e.g., under ~4%) without a specific constraint forcing that
-       level of conservatism — under-utilising the 5% risk budget is a
-       flaw, not a virtue, because it sacrifices return for no good
-       reason.  A portfolio that lands near (but under) 5% should score
-       highest on this criterion; one that lands far below it should
-       be marked down for wasting risk capacity.
-
-    2. RETURN POTENTIAL — Is the expected return realistic and competitive
-       given the constraints?  Penalise both overestimation and unnecessary
-       conservatism.
-
-    3. DIVERSIFICATION — Are risks well-spread across uncorrelated sources?
-       Penalise concentration and hidden correlations (e.g., all equity-like).
-       Penalize the agent for proposing multiple highly correlated assets.
-
-    4. IMPLEMENTABILITY — Can a US retail investor actually buy these
-       instruments easily and cheaply?  Penalise illiquids, high-fee
-       products, or instruments requiring institutional access. Penalize
-       proposing strategies with a total number of tickers > 15.
-
-    5. METHODOLOGY RIGOUR — Is the construction approach sound, or does it
-       hand-wave?  Are the return / risk estimates grounded in data?
-
-    Respond ONLY with a JSON object:
-    {
-      "scores": {
-        "constraint_compliance": int,
-        "return_potential": int,
-        "diversification": int,
-        "implementability": int,
-        "methodology_rigour": int
-      },
-      "critique": "Detailed critique addressing each criterion …",
-      "passed": true/false
-    }
-
-    THE "passed" FIELD IS YOUR INDEPENDENT JUDGEMENT (not a derived rule).
-    Return passed=true ONLY if you would unconditionally recommend this
-    portfolio to a real client TODAY.  Return passed=false — even if the
-    average score is ≥ 7 — when you found ANY of:
-      • A binding hard-constraint violation (FX hedging, ticker cap,
-        sector cap, leverage, instrument restrictions, etc.).
-      • A realistic historical scenario where the POST-mechanism annual
-        loss still breaches the 5% cap — i.e., even crediting the
-        spec's enforcement mechanism as designed, the portfolio would
-        have lost more than 5% in 2008 / 2020 / 2022.  A pre-mechanism
-        gross loss above 5% is NOT a fail on its own when the mechanism
-        plausibly contains the post-mechanism loss.
-      • Material methodology gaps that make the loss estimates
-        unreliable (e.g., key scenarios not stress-tested at all,
-        return / risk numbers invented out of thin air, instruments
-        outside the spec's `asset_universe`).
-    Your "passed" value will be combined with the numeric pass rule
-    (average ≥ 7 AND no single score ≤ 4) — all three must hold to pass.
-
-    CRITIQUE FLAGS RISKS EVEN WHEN PASSING — IMPORTANT:
-    The pass/fail judgement and the critique serve different purposes.
-    Pass on the merits of the spec as written; flag the residual risks
-    of the mechanism the spec relies on SEPARATELY in your critique so
-    the human reader can see them.  Even when you return passed=true,
-    your critique MUST surface the failure modes of the enforcement
-    mechanism, including (when applicable):
-      • Trigger slippage in fast-moving markets
-      • Whipsaw risk — trigger de-risks then misses the rebound
-      • Gap-down risk — a single session that overshoots the trigger
-        threshold before any de-risking can execute
-      • Basis risk in hedge overlays (hedge moves differently than
-        the asset it's meant to protect)
-      • Liquidity / execution risk during a stress event
-      • Reliance on a single mechanism as the sole tail backstop
-    Mention which scenario each risk would matter in.  Do NOT lower the
-    pass judgement on the basis of these risks alone if the mechanism
-    plausibly works as designed — flag them and pass.
-
-    No markdown fences — raw JSON only.
-""")
-
-
-def run_evaluator(
-    spec: InvestmentSpec,
-    proposal: PortfolioProposal,
-) -> EvaluationResult:
-    print("\n" + "=" * 60)
-    print("EVALUATOR — stress-testing the portfolio …")
-    print("=" * 60)
-
-    user_msg = (
-        f"INVESTMENT SPEC:\n{spec.raw_text}\n\n"
-        f"PROPOSED PORTFOLIO:\n{proposal.raw_text}\n"
-    )
-
-    raw = call_claude(EVALUATOR_SYSTEM, user_msg)
-    print(raw[:600], "…\n" if len(raw) > 600 else "\n")
-
-    data = _parse_json_response(raw, agent="evaluator")
-
-    scores = data.get("scores", {})
-    avg = sum(scores.values()) / len(scores) if scores else 0
-    any_critical_fail = any(v <= 4 for v in scores.values())
-    # Honor the evaluator's own pass/fail judgement.  The model often spots
-    # binding-constraint violations (e.g. FX hedging, ticker count) that the
-    # numeric average + min-score rule alone would let through.  Missing
-    # field defaults to False — we want an explicit "yes" from the model.
-    model_said_passed = bool(data.get("passed", False))
-    passed = (
-        avg >= PASS_THRESHOLD
-        and not any_critical_fail
-        and model_said_passed
-    )
-
-    return EvaluationResult(
-        passed=passed,
-        scores=scores,
-        average_score=round(avg, 2),
-        critique=data.get("critique", ""),
-        raw_text=raw,
-    )
-
-
-# ---------------------------------------------------------------------------
-# AGENT 4 — REFINER  (post-selection fine-tuner)
-# ---------------------------------------------------------------------------
-REFINER_SYSTEM = textwrap.dedent("""\
-    You are a senior portfolio fine-tuner.  Your input is:
-      • An investment specification.
-      • A portfolio that has already been selected as the best of several
-        candidates.
-      • A detailed critique from the QA evaluator pointing out specific
-        issues with that portfolio.
-
-    Your job is to produce a REVISED portfolio that addresses every issue
-    raised in the critique, while preserving everything the critique did
-    NOT flag.  This is a SURGICAL EDIT, not a rewrite.
-
-    Hard rules:
-    1. Maintain the ≤5% max annual loss constraint under realistic
-       historical scenarios (2008, 2020, 2022).
-    2. Aim expected_max_drawdown close to (but under) 5% — do NOT waste
-       the risk budget by becoming overly conservative.
-    3. Address EVERY distinct issue in the critique.  If the critique
-       lists three separate problems, your revision must visibly address
-       all three.
-    4. Preserve unflagged characteristics of the original portfolio:
-       keep instruments and weights that the critique did not call out,
-       unless removing them is necessary to fix something that WAS
-       flagged.
-
-    Use the rationale field to explain, point by point, how each
-    critique item was addressed.  Be concrete: "Issue X — fixed by Y".
-
-    Respond ONLY with a JSON object using the same schema as the Generator:
-    {
-      "allocations": {"TICKER_OR_ASSET": weight, ...},
-      "descriptions": {"TICKER_OR_ASSET": "one-line plain-English description", ...},
-      "expected_annual_return": float,
-      "expected_max_drawdown": float,
-      "methodology": "string",
-      "rationale": "string — must address each critique point explicitly"
-    }
-
-    The "descriptions" map must contain one entry per ticker.
-    Weights must sum to 1.0.  No markdown fences — raw JSON only.
-""")
-
-
-def run_refiner(
-    spec: InvestmentSpec,
-    selected_proposal: PortfolioProposal,
-    selected_evaluation: EvaluationResult,
-) -> PortfolioProposal:
-    """
-    Take the harness-selected portfolio plus the evaluator's critique and
-    produce a single revised proposal that addresses every critique item.
-    """
-    print("\n" + "=" * 60)
-    print("REFINER — fine-tuning the selected portfolio against critique …")
-    print("=" * 60)
-
-    user_msg = (
-        f"INVESTMENT SPEC:\n{spec.raw_text}\n\n"
-        f"SELECTED PORTFOLIO (currently best of {MAX_ITERATIONS}):\n"
-        f"{selected_proposal.raw_text}\n\n"
-        f"EVALUATOR SCORES: {selected_evaluation.scores} "
-        f"(average {selected_evaluation.average_score})\n"
-        f"EVALUATOR PASS JUDGEMENT: {selected_evaluation.passed}\n\n"
-        f"DETAILED CRITIQUE TO ADDRESS:\n{selected_evaluation.critique}\n\n"
-        f"Produce a revised portfolio that fixes every issue above while "
-        f"preserving the rest.  Spell out in `rationale` how each critique "
-        f"point was addressed."
-    )
-
-    raw = call_claude(REFINER_SYSTEM, user_msg, max_tokens=REFINER_MAX_TOKENS)
-    print(raw[:600], "…\n" if len(raw) > 600 else "\n")
-
-    data = _parse_json_response(raw, agent="refiner")
-
-    return PortfolioProposal(
-        allocations=data.get("allocations", {}),
-        descriptions=data.get("descriptions", {}),
-        expected_annual_return=data.get("expected_annual_return", 0),
-        expected_max_drawdown=data.get("expected_max_drawdown", 0),
-        methodology=data.get("methodology", ""),
-        rationale=data.get("rationale", ""),
-        raw_text=raw,
-    )
 
 
 def _refinement_improvements(
@@ -734,103 +110,6 @@ def _refinement_improvements(
         "passed_after": refined_eval.passed,
         "allocation_changes": allocation_changes,
     }
-
-
-# ---------------------------------------------------------------------------
-# AGENT 5 — ADVISOR  (advisory only, never modifies the portfolio)
-# ---------------------------------------------------------------------------
-ADVISOR_SYSTEM = textwrap.dedent("""\
-    You are a portfolio diversification advisor.  You are NOT allowed to
-    change the portfolio.  Your single job is to look at the FINAL
-    portfolio (which has already passed QA or been chosen as the best
-    effort) and surface two things for the human reader:
-
-    1. A pairwise CORRELATION SNAPSHOT for tickers that move similarly.
-       For every PAIR of holdings whose long-run correlation is |ρ| ≥ 0.5,
-       output an entry.  Use realistic historical correlations (you may
-       approximate from memory; this is a snapshot, not a backtest).
-       Be honest about uncertainty — these are model-recalled, not
-       computed from data.
-
-    2. Concrete SIMPLIFICATION SUGGESTIONS.  For each cluster of highly
-       correlated holdings (typically ρ ≥ 0.75) that look redundant,
-       propose a specific consolidation.
-
-    HARD RULES for suggestions:
-    • Suggest a REAL replacement ticker (e.g., GOVT, AGG, VXUS, BNDX)
-      that a US retail investor can buy easily.  Do not invent tickers.
-    • Be EXPLICIT about what the user gives up — every suggestion MUST
-      include a "tradeoff" string.  Examples of legitimate tradeoffs:
-        "Loses the explicit short/intermediate Treasury barbell."
-        "Loses tax-exempt muni income exposure."
-        "Combines investment-grade credit with Treasuries — credit risk
-         becomes implicit rather than sized separately."
-    • Do NOT suggest consolidations across genuinely different risk
-      factors (e.g., merging LQD into IEF collapses credit and rate
-      exposure — flag it as a NOT-recommended merge if you mention it).
-    • If the portfolio is already well-consolidated, return an empty
-      "suggestions" list rather than inventing weak ideas.
-
-    Respond ONLY with a JSON object:
-    {
-      "correlation_pairs": [
-        {"a": "TICKER_A", "b": "TICKER_B", "rho": 0.85,
-         "note": "optional short context"},
-        ...
-      ],
-      "suggestions": [
-        {
-          "merge_from": ["TICKER_X", "TICKER_Y"],
-          "merge_into": "REPLACEMENT_TICKER",
-          "rationale": "one-sentence why they overlap",
-          "tradeoff": "explicit description of what is lost"
-        },
-        ...
-      ],
-      "notes": "optional caveats about correlation estimates / regime sensitivity"
-    }
-
-    No markdown fences — raw JSON only.
-""")
-
-
-def run_advisor(final_proposal: PortfolioProposal) -> AdvisorOutput:
-    """
-    Inspect the final portfolio and produce advisory consolidation
-    suggestions plus a pairwise correlation snapshot.  Never modifies
-    the portfolio itself.
-    """
-    print("\n" + "=" * 60)
-    print("ADVISOR — scanning final portfolio for correlation / simplification …")
-    print("=" * 60)
-
-    # Build a compact view of the holdings (ticker, weight, description)
-    rows = []
-    descs = final_proposal.descriptions or {}
-    for ticker, weight in final_proposal.allocations.items():
-        desc = descs.get(ticker, "")
-        rows.append(f"  {ticker:30s}  {float(weight):.2%}   {desc}")
-    holdings_block = "\n".join(rows) if rows else "  (empty)"
-
-    user_msg = (
-        f"FINAL PORTFOLIO (do NOT modify — advise only):\n{holdings_block}\n\n"
-        f"Produce the correlation snapshot and simplification suggestions "
-        f"per the system prompt schema.  Focus on pairs that move together "
-        f"in normal regimes; flag (in notes) any pairs whose correlation "
-        f"changes materially in stress."
-    )
-
-    raw = call_claude(ADVISOR_SYSTEM, user_msg, model=ADVISOR_MODEL)
-    print(raw[:500], "…\n" if len(raw) > 500 else "\n")
-
-    data = _parse_json_response(raw, agent="advisor")
-
-    return AdvisorOutput(
-        suggestions=data.get("suggestions", []) or [],
-        correlation_pairs=data.get("correlation_pairs", []) or [],
-        notes=data.get("notes", "") or "",
-        raw_text=raw,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1038,7 +317,7 @@ def run_harness(
         proposal = run_generator(spec, feedback=feedback, iteration=i)
 
         # --- Step 3: Evaluate ---
-        evaluation = run_evaluator(spec, proposal)
+        evaluation = run_evaluator(spec, proposal, pass_threshold=PASS_THRESHOLD)
 
         proposals.append(proposal)
         evaluations.append(evaluation)
@@ -1160,8 +439,13 @@ def run_harness(
         refinement_block["skipped_reason"] = "no critique available to refine against"
         print("\n(Refinement step skipped — no critique available.)\n")
     else:
-        refined_proposal = run_refiner(spec, selected_proposal, selected_evaluation)
-        refined_evaluation = run_evaluator(spec, refined_proposal)
+        refined_proposal = run_refiner(
+            spec, selected_proposal, selected_evaluation,
+            max_iterations=MAX_ITERATIONS,
+        )
+        refined_evaluation = run_evaluator(
+            spec, refined_proposal, pass_threshold=PASS_THRESHOLD,
+        )
 
         print(f"\n--- Refinement result ---")
         print(f"  Scores              : {refined_evaluation.scores}")
@@ -1271,7 +555,7 @@ def run_harness(
         }
 
     return {
-        "model": MODEL,
+        "model": api.MODEL,
         "max_iterations": MAX_ITERATIONS,
         "pass_threshold": PASS_THRESHOLD,
         "target_max_loss": TARGET_MAX_LOSS,
@@ -1404,15 +688,17 @@ if __name__ == "__main__":
     capital = args.capital
     if args.test:
         # --test forces ALL agents to haiku (and disables everything else).
-        MODEL = _MODEL_ALIASES["haiku"]
-        PLANNER_MODEL = _MODEL_ALIASES["haiku"]
-        ADVISOR_MODEL = _MODEL_ALIASES["haiku"]
+        # Per-agent model globals live in api.py — patch them there so
+        # call_claude picks them up on the next call.
+        api.MODEL = _MODEL_ALIASES["haiku"]
+        api.PLANNER_MODEL = _MODEL_ALIASES["haiku"]
+        api.ADVISOR_MODEL = _MODEL_ALIASES["haiku"]
         MAX_ITERATIONS = 1
         refine = False   # --test always implies --no-refine
         advise = False   # --test always implies --no-advisor
         price = False    # --test always implies --no-prices
         print(
-            f"[TEST MODE] model={MODEL}  iterations={MAX_ITERATIONS}  "
+            f"[TEST MODE] model={api.MODEL}  iterations={MAX_ITERATIONS}  "
             f"refine={refine}  advise={advise}  price={price}"
         )
     else:
@@ -1421,16 +707,16 @@ if __name__ == "__main__":
             # the entire pipeline on one tier, useful for cost / quality
             # comparison or when one tier is overloaded).
             resolved = _MODEL_ALIASES.get(args.model, args.model)
-            MODEL = resolved
-            PLANNER_MODEL = resolved
-            ADVISOR_MODEL = resolved
-            print(f"[model override — all agents] {MODEL}")
+            api.MODEL = resolved
+            api.PLANNER_MODEL = resolved
+            api.ADVISOR_MODEL = resolved
+            print(f"[model override — all agents] {api.MODEL}")
         else:
             # No override — show the per-agent assignments so the user
             # knows the pipeline isn't uniform.
             print(
-                f"[per-agent models] generator/evaluator/refiner={MODEL}  "
-                f"planner={PLANNER_MODEL}  advisor={ADVISOR_MODEL}"
+                f"[per-agent models] generator/evaluator/refiner={api.MODEL}  "
+                f"planner={api.PLANNER_MODEL}  advisor={api.ADVISOR_MODEL}"
             )
         if args.iterations is not None:
             if args.iterations < 1:
