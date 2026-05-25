@@ -34,6 +34,19 @@ from models import (
     InvestmentSpec,
     PortfolioProposal,
 )
+from tools import (
+    COMPUTE_BACKTEST_TOOL,
+    WEB_SEARCH_TOOL,
+    compute_backtest,
+)
+
+
+# Tool registries — agents.py knows which agent gets which tool.
+# Server-side tools (web_search) have no handler — Anthropic runs them.
+# Client-side tools (compute_backtest) need a handler in the dispatch map.
+_PLANNER_TOOLS = [WEB_SEARCH_TOOL]
+_BACKTEST_TOOLS = [COMPUTE_BACKTEST_TOOL]
+_BACKTEST_HANDLERS = {"compute_backtest": compute_backtest}
 
 
 # ---------------------------------------------------------------------------
@@ -53,10 +66,36 @@ PLANNER_SYSTEM = textwrap.dedent("""\
     • Time horizon assumptions and rebalancing cadence
     • Tail-risk scenarios the portfolio must survive
 
-    Respond ONLY with a JSON object with these keys:
+    AVAILABLE TOOL — web_search:
+    Your training data has a knowledge cutoff.  Before writing the spec,
+    use `web_search` (server-side, executed by Anthropic) to check
+    CURRENT market conditions and bake them into the spec.  You have
+    up to 5 searches — be specific about what you ask.  Suggested
+    queries (run only the ones you actually need):
+      • "current US federal funds rate"
+      • "current US 10-year Treasury yield"
+      • "S&P 500 current level"
+      • "current VIX level"
+      • Any recent (last 30 days) macro news that should inform asset
+        universe selection or the risk budget (e.g., Fed policy shift,
+        major credit event, geopolitical regime change).
+    Cite the numbers you find in the spec's `objective` or
+    `risk_budget` field so the downstream construction agent knows
+    what regime you assumed.
+
+    Your FINAL response must be ONLY a raw JSON object with these keys:
       objective, constraints, asset_universe, risk_budget, evaluation_criteria
 
-    No markdown fences — raw JSON only.
+    Strict format rules — your response will be machine-parsed:
+      • The response MUST begin with `{` and end with `}`.  Nothing
+        before, nothing after.
+      • NO markdown fences (no ```json, no ```).
+      • NO prose preamble such as "Here is the spec:", "Based on my
+        searches:", "Now I will provide:", etc.
+      • If you used web_search, bake the findings DIRECTLY into the
+        relevant field values (objective, risk_budget, etc.).  Do NOT
+        narrate the search process or summarise what you found in
+        prose — just incorporate the numbers into the fields.
 """)
 
 
@@ -65,7 +104,12 @@ def run_planner(user_goal: str) -> InvestmentSpec:
     print("PLANNER — expanding user goal into investment spec …")
     print("=" * 60)
 
-    raw = call_claude(PLANNER_SYSTEM, user_goal, model=api.PLANNER_MODEL)
+    raw = call_claude(
+        PLANNER_SYSTEM, user_goal,
+        model=api.PLANNER_MODEL,
+        max_tokens=api.PLANNER_MAX_TOKENS,   # spec + web_search needs >4096
+        tools=_PLANNER_TOOLS,                # web_search (server-side)
+    )
     print(raw[:500], "…\n" if len(raw) > 500 else "\n")
 
     data = _parse_json_response(raw, agent="planner")
@@ -214,6 +258,30 @@ EVALUATOR_SYSTEM = textwrap.dedent("""\
 
     Grade each criterion on a 1-10 scale.  Be specific about failures.
 
+    AVAILABLE TOOL — compute_backtest:
+    You have a `compute_backtest(weights, start_date, end_date)` tool
+    that returns the ACTUAL historical performance of any portfolio
+    over any date range (total return, max drawdown, volatility,
+    plus a list of any tickers that had no data in the range).
+    USE IT.  Do not estimate 2008 / 2020 / 2022 losses from training
+    memory — invoke the tool and use the returned numbers to score
+    CONSTRAINT_COMPLIANCE.
+
+    Suggested invocations for the standard stress windows:
+      • 2008 GFC:        start='2008-01-01', end='2008-12-31'
+      • 2020 COVID:      start='2020-02-01', end='2020-12-31'
+      • 2022 rate-hike:  start='2022-01-01', end='2022-12-31'
+
+    Pay attention to `tickers_missing_data` and `coverage_weight` in
+    the result — if a meaningful weight of the portfolio wasn't around
+    in the date range (e.g., DBMF didn't exist in 2008), reason about
+    whether a comparable substitute would have changed the outcome,
+    and call out the partial coverage in your critique.
+
+    The tool returns the PRE-MECHANISM gross loss.  Apply the spec's
+    enforcement mechanism on top of that (see CRITERION 1 below) to
+    get the post-mechanism loss you judge against the 5% cap.
+
     CRITERIA (graded 1-10):
     1. CONSTRAINT COMPLIANCE — Does the portfolio stay within the ≤5%
        max annual loss constraint under realistic historical scenarios?
@@ -346,7 +414,15 @@ def run_evaluator(
         f"PROPOSED PORTFOLIO:\n{proposal.raw_text}\n"
     )
 
-    raw = call_claude(EVALUATOR_SYSTEM, user_msg)
+    raw = call_claude(
+        EVALUATOR_SYSTEM, user_msg,
+        tools=_BACKTEST_TOOLS,
+        tool_handlers=_BACKTEST_HANDLERS,
+        # 3 standard stress windows + headroom for sub-scenarios + final
+        # text emission; well clear of the default 8 but explicit here so
+        # the cap is documented at the call site.
+        max_tool_rounds=10,
+    )
     print(raw[:600], "…\n" if len(raw) > 600 else "\n")
 
     data = _parse_json_response(raw, agent="evaluator")
@@ -389,9 +465,19 @@ REFINER_SYSTEM = textwrap.dedent("""\
     raised in the critique, while preserving everything the critique did
     NOT flag.  This is a SURGICAL EDIT, not a rewrite.
 
+    AVAILABLE TOOL — compute_backtest:
+    You have a `compute_backtest(weights, start_date, end_date)` tool
+    that returns actual historical performance.  Use it to VERIFY your
+    revised portfolio before emitting it — at minimum on 2008
+    (start='2008-01-01', end='2008-12-31'), 2020 (start='2020-02-01',
+    end='2020-12-31'), and 2022 (start='2022-01-01', end='2022-12-31').
+    If a backtest shows the revision still breaches the 5% cap (after
+    accounting for the spec's enforcement_mechanism), iterate further
+    before responding — don't ship weights you haven't verified.
+
     Hard rules:
     1. Maintain the ≤5% max annual loss constraint under realistic
-       historical scenarios (2008, 2020, 2022).
+       historical scenarios (2008, 2020, 2022).  Verify with the tool.
     2. Aim expected_max_drawdown close to (but under) 5% — do NOT waste
        the risk budget by becoming overly conservative.
     3. Address EVERY distinct issue in the critique.  If the critique
@@ -454,7 +540,14 @@ def run_refiner(
     )
 
     raw = call_claude(
-        REFINER_SYSTEM, user_msg, max_tokens=api.REFINER_MAX_TOKENS,
+        REFINER_SYSTEM, user_msg,
+        max_tokens=api.REFINER_MAX_TOKENS,
+        tools=_BACKTEST_TOOLS,
+        tool_handlers=_BACKTEST_HANDLERS,
+        # Refiner may iterate: backtest → see breach → adjust weights →
+        # backtest again.  Give it room (3 windows × 2-3 attempts +
+        # final emission).
+        max_tool_rounds=12,
     )
     print(raw[:600], "…\n" if len(raw) > 600 else "\n")
 
