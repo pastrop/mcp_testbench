@@ -4,6 +4,10 @@ Research-mode tool: turn a `harness_output.json` file + a natural-language reque
 
 This is a **standalone exploration** — completely decoupled from the harness pipeline. It reads the static JSON file and produces a single HTML file. No build step, no server, no scaffolding.
 
+Two modes:
+- **One-shot** (default): generate → save → open in browser → done.
+- **Interactive** (`--interactive` / `-i`): generate the initial dashboard, then enter a REPL where you can ask Claude to refine the file in place ("make the chart bigger", "switch to a dark theme", "add a tab for the advisor pairs"). Uses the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview) under the hood — Claude reads the current HTML, applies targeted `Edit` calls, and you reload the browser to see the change.
+
 ## How it works
 
 ```
@@ -73,6 +77,16 @@ uv run long_running_agent/viz/ui_designer.py long_running_agent/harness_output.j
     --prompt "executive summary at the top, then an accordion for each iteration" \
     -o ~/Desktop/portfolio_dashboard.html \
     --no-open
+
+# 9. Interactive refinement — generate once, then iterate
+uv run long_running_agent/viz/ui_designer.py long_running_agent/harness_output.json \
+    --interactive \
+    --prompt "compare iteration scores side by side"
+# Once the dashboard opens, you can type follow-ups at the `refine>` prompt:
+#   refine> make the comparison a single grouped bar chart
+#   refine> use a darker accent — the green is hard to read
+#   refine> add a section at the top with the headline pass/fail verdict
+# Reload the browser to see each change.  Empty line / 'exit' / Ctrl+D to leave.
 ```
 
 ## CLI flags
@@ -84,6 +98,7 @@ uv run long_running_agent/viz/ui_designer.py long_running_agent/harness_output.j
 | `--model` | Default `claude-opus-4-7`. Accepts the aliases `haiku`, `sonnet`, `opus`, or a full model ID. |
 | `--max-tokens` | Output token budget. Default `32768`. It's a *ceiling*, not a quota — you only pay for tokens actually generated, so set it high. Opus caps at 32k; Sonnet supports up to 64k. Bump (and switch to Sonnet) if the dashboard truncates. |
 | `--no-open` | Save the HTML but don't auto-open in the browser. |
+| `--interactive`, `-i` | After the initial generation, enter a REPL backed by the Claude Agent SDK. Each turn reads the current dashboard, applies targeted edits, and prints a one-line summary; you reload the browser to see the change. Session writes are scoped to the dashboard file (every other path is refused). |
 
 ## Example requests worth trying
 
@@ -119,6 +134,6 @@ This is an exploration to see whether on-demand LLM-generated UI is conceptually
 
 - Generated dashboards are static — no live data, no two-way interaction with the harness.
 - Claude can write broken JS/HTML; usually visible in the browser console. Re-run with a clearer prompt if so.
-- No conversational refinement loop yet — each invocation is independent. (Could be added as a follow-up.)
-- No prompt caching yet. If you iterate on requests for the same JSON, the JSON gets re-sent each time. (Trivial to add — system prompt is stable, only the request varies.)
+- Interactive mode does not auto-refresh the browser — reload manually after each edit. A websocket / hot-reload bridge would be a natural next step.
+- No prompt caching yet on the one-shot path. If you iterate on requests for the same JSON, the JSON gets re-sent each time. (The Agent SDK in `--interactive` mode keeps the conversation in a single session, so the file is only sent once per session.)
 - Generated dashboards are gitignored on purpose — they're not source of truth, they're disposable views.

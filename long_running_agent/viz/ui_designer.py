@@ -22,6 +22,7 @@ via CDN, vanilla JS for interactivity) and is constrained only by the
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -216,6 +217,167 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 
 
 # ---------------------------------------------------------------------------
+# Refinement system prompt — used by the interactive REPL after the initial
+# dashboard has been generated.  The agent's job here is targeted edits, not
+# regeneration: read the current file, apply a minimal patch, describe it.
+# ---------------------------------------------------------------------------
+REFINE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent("""\
+    You are an expert front-end UI designer continuing to refine an
+    interactive HTML dashboard for a portfolio-optimization harness.
+
+    The dashboard file lives at:
+      {dashboard_path}
+
+    HOW TO WORK:
+      • Always Read the file BEFORE editing — it is the ground truth.
+      • Prefer targeted Edit calls (small old_string/new_string ranges)
+        over rewriting the whole file.  Reach for Write only if the user
+        explicitly asks for a wholesale restructure.
+      • Preserve the inline `<script>const data = {{ ... }};</script>`
+        block — that is the harness JSON.  Never modify the data itself.
+      • Preserve the CDN script tags in <head> (Tailwind, Chart.js,
+        Plotly, marked) unless the user explicitly asks to remove them.
+      • After applying your edits, give a one- or two-sentence summary
+        of what changed.  The user reloads the browser themselves.
+
+    DESIGN PRINCIPLES (unchanged from the initial generation):
+      • Be expressive — tabs, drill-downs, conditional formatting,
+        sortable tables, hover tooltips, side-by-side comparisons.
+      • Be honest — if the user asks for data the JSON does not
+        contain (e.g. Sharpe ratio), add a visible note in the
+        dashboard rather than fabricating values.
+      • Single self-contained file — no external assets you author.
+""")
+
+
+# ---------------------------------------------------------------------------
+# Interactive refinement loop (Claude Agent SDK)
+# ---------------------------------------------------------------------------
+# Layered on top of the existing one-shot generator.  Turn 1 still goes
+# through the raw Anthropic streaming path (proven, ~30s on Opus).  From
+# turn 2 onwards we hand the file to a ClaudeSDKClient session restricted
+# to Read / Edit / Write on the dashboard file itself.  The SDK manages
+# the tool loop, the file edits, and the conversation history; we just
+# print results and re-prompt.
+async def interactive_refinement(dashboard_path: Path, model: str) -> int:
+    """REPL: read user requests, dispatch Read/Edit via SDK, loop until exit."""
+    try:
+        from claude_agent_sdk import (
+            AssistantMessage,
+            ClaudeAgentOptions,
+            ClaudeSDKClient,
+            PermissionResultAllow,
+            PermissionResultDeny,
+            ResultMessage,
+            TextBlock,
+            ToolUseBlock,
+        )
+    except ImportError:
+        print(
+            "ERROR: --interactive requires the `claude-agent-sdk` package. "
+            "Install with `uv add claude-agent-sdk` (already declared in "
+            "pyproject.toml — run `uv sync`).",
+            file=sys.stderr,
+        )
+        return 2
+
+    dashboard_abs = dashboard_path.resolve()
+
+    def is_dashboard_path(p: object) -> bool:
+        if not isinstance(p, str) or not p:
+            return False
+        try:
+            return Path(p).resolve() == dashboard_abs
+        except OSError:
+            return False
+
+    async def can_use_tool(tool_name, input_data, _context):
+        # Read / Edit / Write are allowed, but ONLY on the dashboard file
+        # itself.  Everything else is denied with a clear message so the
+        # model can adjust on the next round.
+        if tool_name in {"Read", "Edit", "Write"}:
+            if is_dashboard_path(input_data.get("file_path")):
+                return PermissionResultAllow(updated_input=input_data)
+            return PermissionResultDeny(
+                message=(
+                    f"This session only has access to {dashboard_abs}. "
+                    f"Refused {tool_name} on "
+                    f"{input_data.get('file_path')!r}."
+                ),
+                interrupt=False,
+            )
+        return PermissionResultDeny(
+            message=f"Tool {tool_name!r} is not available in refinement mode.",
+            interrupt=False,
+        )
+
+    options = ClaudeAgentOptions(
+        model=model,
+        system_prompt=REFINE_SYSTEM_PROMPT_TEMPLATE.format(
+            dashboard_path=str(dashboard_abs),
+        ),
+        allowed_tools=["Read", "Edit", "Write"],
+        can_use_tool=can_use_tool,
+        cwd=str(dashboard_abs.parent),
+        # We're not asking the model to plan complex workflows — a single
+        # refinement should converge in 2-4 tool calls (Read, then 1-3
+        # Edits).  Cap it so a runaway loop doesn't burn budget.
+        max_turns=15,
+    )
+
+    print()
+    print("─" * 70)
+    print("Entering interactive refinement mode.")
+    print(f"Dashboard:  {dashboard_abs}")
+    print(f"Model:      {model}")
+    print("Describe what to change, then reload the browser to see edits.")
+    print("Empty line, 'exit', 'quit', or Ctrl+D to leave.")
+    print("─" * 70)
+
+    try:
+        async with ClaudeSDKClient(options=options) as client:
+            while True:
+                print()
+                try:
+                    user_input = input("refine> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n(exiting interactive mode)")
+                    return 0
+                if not user_input:
+                    continue
+                if user_input.lower() in {"exit", "quit", "q"}:
+                    print("(exiting interactive mode)")
+                    return 0
+
+                await client.query(user_input)
+                edits_made = 0
+                async for message in client.receive_response():
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                text = block.text.strip()
+                                if text:
+                                    print(text)
+                            elif isinstance(block, ToolUseBlock):
+                                if block.name in {"Edit", "Write"}:
+                                    edits_made += 1
+                                # One-line tool-call trace so the user can
+                                # see what the agent is doing.
+                                fp = block.input.get("file_path", "") if isinstance(block.input, dict) else ""
+                                suffix = f" {Path(fp).name}" if fp else ""
+                                print(f"  · {block.name}{suffix}")
+                    elif isinstance(message, ResultMessage):
+                        if edits_made:
+                            print(
+                                f"\n↻ Reload the dashboard in your browser "
+                                f"({edits_made} change{'s' if edits_made != 1 else ''} applied)."
+                            )
+    except KeyboardInterrupt:
+        print("\n(interrupted)")
+        return 130
+
+
+# ---------------------------------------------------------------------------
 # HTML extraction — be lenient about whatever wrapper the model emits
 # ---------------------------------------------------------------------------
 def extract_html(response_text: str) -> str:
@@ -316,6 +478,16 @@ def main() -> int:
         "--no-open",
         action="store_true",
         help="Save the dashboard but don't auto-open it in a browser.",
+    )
+    parser.add_argument(
+        "--interactive", "-i",
+        action="store_true",
+        help=(
+            "After the initial generation, enter a REPL where you can ask "
+            "for incremental refinements ('make the chart bigger', 'switch "
+            "to a dark theme', etc.).  Uses the Claude Agent SDK to apply "
+            "targeted edits to the dashboard file in place."
+        ),
     )
     args = parser.parse_args()
 
@@ -436,6 +608,9 @@ def main() -> int:
         url = output_path.resolve().as_uri()
         print(f"  Opening in browser ...")
         webbrowser.open(url)
+
+    if args.interactive:
+        return asyncio.run(interactive_refinement(output_path, model))
 
     return 0
 
